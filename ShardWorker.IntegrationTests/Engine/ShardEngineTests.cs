@@ -13,7 +13,7 @@ public sealed class ShardEngineTests
 {
     private static IHost BuildHost<TWorker>(
         TWorker worker,
-        InMemoryShardLockProvider provider,
+        IShardLockProvider provider,
         Action<ShardWorkerOptions> configure)
         where TWorker : class, IShardedWorker
     {
@@ -147,53 +147,158 @@ public sealed class ShardEngineTests
     }
 
     [Fact]
-    public async Task Engine_ReleaseOnCompletion_ShardReacquiredOnNextCycle()
+    public async Task Engine_ReleaseOnCompletion_ReleasesLockAfterExecution()
     {
-        var worker = new CountingWorker();
+        // After ExecuteAsync returns with ReleaseOnCompletion=true, the engine must
+        // call ReleaseManyAsync so a competing instance can immediately acquire the shard.
+        var firstExecuted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new LambdaWorker((ctx, ct) =>
+        {
+            firstExecuted.TrySetResult();
+            return Task.CompletedTask;
+        });
+
         var provider = new InMemoryShardLockProvider();
         using var host = BuildHost(worker, provider, opts =>
         {
             opts.TotalShards = 1;
             opts.ReleaseOnCompletion = true;
-            opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+            opts.AcquireInterval = TimeSpan.FromSeconds(5); // long gap — gives time to probe before re-acquire
             opts.WorkerInterval = TimeSpan.FromMilliseconds(0);
-            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(500);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
             opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
         });
 
         await host.StartAsync();
+        await firstExecuted.Task.WaitAsync(TimeSpan.FromSeconds(8));
 
-        // With ReleaseOnCompletion, shard 0 is released then re-acquired on every cycle.
-        // The worker should be called many times in a few seconds.
-        await WaitForAsync(() => worker.Count >= 5);
+        // Give the async finally block time to call ReleaseManyAsync
+        await Task.Delay(300);
+
+        // A competing instance must now be able to claim shard 0
+        var stolen = await provider.TryAcquireManyAsync([0], "competitor", TimeSpan.FromSeconds(30));
+        Assert.Contains(0, stolen);
 
         await host.StopAsync();
-        Assert.True(worker.Count >= 5, $"Expected ≥ 5 executions, got {worker.Count}");
     }
 
     [Fact]
-    public async Task Engine_ReleaseOnThrows_ShardReacquiredAfterError()
+    public async Task Engine_ReleaseOnThrows_ReleasesLockAfterException()
     {
-        var worker = new ThrowingWorker();
+        // After ExecuteAsync throws with ReleaseOnThrows=true, the engine must
+        // call ReleaseManyAsync so a competing instance can immediately acquire the shard.
+        var firstThrown = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new LambdaWorker((ctx, ct) =>
+        {
+            firstThrown.TrySetResult();
+            throw new InvalidOperationException("deliberate failure");
+        });
+
         var provider = new InMemoryShardLockProvider();
         using var host = BuildHost(worker, provider, opts =>
         {
             opts.TotalShards = 1;
             opts.ReleaseOnThrows = true;
-            opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+            opts.AcquireInterval = TimeSpan.FromSeconds(5); // long gap — gives time to probe before re-acquire
             opts.WorkerInterval = TimeSpan.FromMilliseconds(0);
-            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(500);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
             opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
         });
 
         await host.StartAsync();
+        await firstThrown.Task.WaitAsync(TimeSpan.FromSeconds(8));
 
-        // Worker always throws; with ReleaseOnThrows=true the shard is released
-        // each time, so the engine re-acquires and calls it again.
-        await WaitForAsync(() => worker.Calls >= 3);
+        // Give the async finally block time to call ReleaseManyAsync
+        await Task.Delay(300);
+
+        // A competing instance must now be able to claim shard 0
+        var stolen = await provider.TryAcquireManyAsync([0], "competitor", TimeSpan.FromSeconds(30));
+        Assert.Contains(0, stolen);
 
         await host.StopAsync();
-        Assert.True(worker.Calls >= 3, $"Expected ≥ 3 calls, got {worker.Calls}");
+    }
+
+    [Fact]
+    public async Task Engine_Heartbeat_RenewsLockBeforeExpiry()
+    {
+        // The heartbeat loop must renew held shards before LockExpiry elapses.
+        // If it works, a competitor cannot steal the shard even after LockExpiry has passed.
+        var workerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var releaseGate = new SemaphoreSlim(0);
+        var worker = new LambdaWorker(async (ctx, ct) =>
+        {
+            workerStarted.TrySetResult();
+            await releaseGate.WaitAsync(ct);
+        });
+
+        var provider = new InMemoryShardLockProvider();
+        using var host = BuildHost(worker, provider, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.LockExpiry = TimeSpan.FromMilliseconds(400);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(100); // renews well within expiry
+            opts.AcquireInterval = TimeSpan.FromMilliseconds(200);
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(0);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
+        });
+
+        await host.StartAsync();
+        await workerStarted.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        // Wait longer than LockExpiry — without heartbeats the lock would have expired
+        await Task.Delay(700);
+
+        // The heartbeat should have renewed the lock; competitor must NOT be able to steal it
+        var stolen = await provider.TryAcquireManyAsync([0], "competitor", TimeSpan.FromSeconds(30));
+        Assert.Empty(stolen);
+
+        releaseGate.Release();
+        await host.StopAsync();
+    }
+
+    [Fact]
+    public async Task Engine_StolenLock_StopsWorker()
+    {
+        // When RenewManyAsync returns fewer shards than held (simulating a stolen lock),
+        // the engine must cancel that shard's worker slot.
+        var workerRunning = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var workerCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int executionCount = 0;
+
+        var worker = new LambdaWorker(async (ctx, ct) =>
+        {
+            Interlocked.Increment(ref executionCount);
+            workerRunning.TrySetResult();
+            try { await Task.Delay(Timeout.Infinite, ct); }
+            catch (OperationCanceledException) { workerCancelled.TrySetResult(); }
+        });
+
+        var innerProvider = new InMemoryShardLockProvider();
+        // Allow the first renew to succeed, then start returning empty — simulates a stolen lock
+        var spyProvider = new FailAfterNthRenewProvider(innerProvider, allowedRenews: 1);
+
+        using var host = BuildHost(worker, spyProvider, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(100);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.AcquireInterval = TimeSpan.FromSeconds(60); // prevent re-acquire during test
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(0);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
+        });
+
+        await host.StartAsync();
+        await workerRunning.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        // Wait for the heartbeat to detect the (simulated) theft and cancel the worker
+        await workerCancelled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Worker must have run exactly once and then been stopped — not retried
+        Assert.Equal(1, executionCount);
+
+        await host.StopAsync();
     }
 
     [Fact]
@@ -317,5 +422,41 @@ public sealed class ShardEngineTests
 
         public Task ExecuteAsync(ShardContext ctx, CancellationToken ct)
             => _execute(ctx, ct);
+    }
+
+    /// <summary>
+    /// Wraps a provider and returns empty from RenewManyAsync after
+    /// <paramref name="allowedRenews"/> successful renewals, simulating a stolen lock.
+    /// </summary>
+    private sealed class FailAfterNthRenewProvider : IShardLockProvider
+    {
+        private readonly IShardLockProvider _inner;
+        private readonly int _allowedRenews;
+        private int _renewCount;
+
+        public FailAfterNthRenewProvider(IShardLockProvider inner, int allowedRenews)
+        {
+            _inner = inner;
+            _allowedRenews = allowedRenews;
+        }
+
+        public Task EnsureSchemaAsync(CancellationToken ct = default)
+            => _inner.EnsureSchemaAsync(ct);
+
+        public Task<IReadOnlyList<int>> TryAcquireManyAsync(
+            IReadOnlyList<int> candidates, string instanceId, TimeSpan expiry, CancellationToken ct = default)
+            => _inner.TryAcquireManyAsync(candidates, instanceId, expiry, ct);
+
+        public Task<IReadOnlyList<int>> RenewManyAsync(
+            IReadOnlyList<int> held, string instanceId, TimeSpan expiry, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _renewCount) > _allowedRenews)
+                return Task.FromResult<IReadOnlyList<int>>(Array.Empty<int>());
+            return _inner.RenewManyAsync(held, instanceId, expiry, ct);
+        }
+
+        public Task ReleaseManyAsync(
+            IReadOnlyList<int> shards, string instanceId, CancellationToken ct = default)
+            => _inner.ReleaseManyAsync(shards, instanceId, ct);
     }
 }
