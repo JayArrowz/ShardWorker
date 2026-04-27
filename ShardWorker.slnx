@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="ShardWorker.Core/ShardWorker.Core.csproj" />
+  <Project Path="ShardWorker.Providers.InMemory/ShardWorker.Providers.InMemory.csproj" />
+  <Project Path="ShardWorker.Providers.MsSql/ShardWorker.Providers.MsSql.csproj" />
+  <Project Path="ShardWorker.Providers.MySql/ShardWorker.Providers.MySql.csproj" />
+  <Project Path="ShardWorker.Providers.Postgres/ShardWorker.Providers.Postgres.csproj" />
+  <Project Path="ShardWorker/ShardWorker.csproj" />
+  <Project Path="ShardWorker.IntegrationTests/ShardWorker.IntegrationTests.csproj" />
+</Solution>
