@@ -5,61 +5,14 @@ on:
     branches: [main, master]
   pull_request:
 
+permissions:
+  contents: read
+  checks: write
+
 jobs:
-  integration-tests:
+  build:
+    name: Build
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_DB: shardworker_test
-          POSTGRES_USER: shardworker
-          POSTGRES_PASSWORD: shardworker
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U shardworker -d shardworker_test"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-      sqlserver:
-        image: mcr.microsoft.com/mssql/server:2022-latest
-        env:
-          SA_PASSWORD: "YourStrong!Passw0rd"
-          ACCEPT_EULA: "Y"
-          MSSQL_PID: Developer
-        ports:
-          - 1433:1433
-        options: >-
-          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'YourStrong!Passw0rd' -Q 'SELECT 1' -No -C"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 15
-
-      mysql:
-        image: mysql:8
-        env:
-          MYSQL_DATABASE: shardworker_test
-          MYSQL_USER: shardworker
-          MYSQL_PASSWORD: shardworker
-          MYSQL_ROOT_PASSWORD: root
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h localhost -u shardworker --password=shardworker"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 10
-
-    env:
-      POSTGRES_CONNECTION_STRING: >-
-        Host=localhost;Port=5432;Database=shardworker_test;Username=shardworker;Password=shardworker
-      MSSQL_CONNECTION_STRING: >-
-        Server=localhost,1433;Database=master;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True
-      MYSQL_CONNECTION_STRING: >-
-        Server=localhost;Port=3306;Database=shardworker_test;User=shardworker;Password=shardworker;
 
     steps:
       - uses: actions/checkout@v4
@@ -78,10 +31,205 @@ jobs:
       - name: Build
         run: dotnet build ShardWorker.slnx --no-restore --configuration Release
 
+      - name: Upload test binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-binaries
+          # The test project is net8.0; its output folder contains all resolved
+          # project-reference DLLs, so no other project's bin/ is needed.
+          path: ShardWorker.IntegrationTests/bin/Release/net8.0/
+          retention-days: 1
+
+  test-in-memory:
+    name: Tests / InMemory & Engine
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.x
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-binaries
+          path: ShardWorker.IntegrationTests/bin/Release/net8.0/
+
       - name: Run tests
         run: >-
-          dotnet test ShardWorker.IntegrationTests/ShardWorker.IntegrationTests.csproj
-          --no-build
-          --configuration Release
-          --verbosity normal
-          --logger "console;verbosity=detailed"
+          dotnet test ShardWorker.IntegrationTests/bin/Release/net8.0/ShardWorker.IntegrationTests.dll
+          --filter "FullyQualifiedName~InMemoryProviderTests|FullyQualifiedName~ShardEngineTests"
+          --logger "trx;LogFileName=results.trx"
+          --results-directory "${{ github.workspace }}/test-results"
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: InMemory & Engine
+          path: test-results/results.trx
+          reporter: dotnet-trx
+          fail-on-error: true
+
+  test-postgres:
+    name: Tests / PostgreSQL
+    needs: build
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: shardworker_test
+          POSTGRES_USER: shardworker
+          POSTGRES_PASSWORD: shardworker
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U shardworker -d shardworker_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      POSTGRES_CONNECTION_STRING: >-
+        Host=localhost;Port=5432;Database=shardworker_test;Username=shardworker;Password=shardworker
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.x
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-binaries
+          path: ShardWorker.IntegrationTests/bin/Release/net8.0/
+
+      - name: Run tests
+        run: >-
+          dotnet test ShardWorker.IntegrationTests/bin/Release/net8.0/ShardWorker.IntegrationTests.dll
+          --filter "Provider=Postgres"
+          --logger "trx;LogFileName=results.trx"
+          --results-directory "${{ github.workspace }}/test-results"
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: PostgreSQL
+          path: test-results/results.trx
+          reporter: dotnet-trx
+          fail-on-error: true
+
+  test-mssql:
+    name: Tests / SQL Server
+    needs: build
+    runs-on: ubuntu-latest
+
+    services:
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2022-latest
+        env:
+          SA_PASSWORD: "YourStrong!Passw0rd"
+          ACCEPT_EULA: "Y"
+          MSSQL_PID: Developer
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'YourStrong!Passw0rd' -Q 'SELECT 1' -No -C"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 15
+
+    env:
+      MSSQL_CONNECTION_STRING: >-
+        Server=localhost,1433;Database=master;User Id=sa;Password=YourStrong!Passw0rd;TrustServerCertificate=True
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.x
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-binaries
+          path: ShardWorker.IntegrationTests/bin/Release/net8.0/
+
+      - name: Run tests
+        run: >-
+          dotnet test ShardWorker.IntegrationTests/bin/Release/net8.0/ShardWorker.IntegrationTests.dll
+          --filter "Provider=MsSql"
+          --logger "trx;LogFileName=results.trx"
+          --results-directory "${{ github.workspace }}/test-results"
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: SQL Server
+          path: test-results/results.trx
+          reporter: dotnet-trx
+          fail-on-error: true
+
+  test-mysql:
+    name: Tests / MySQL
+    needs: build
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_DATABASE: shardworker_test
+          MYSQL_USER: shardworker
+          MYSQL_PASSWORD: shardworker
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd "mysqladmin ping -h localhost -u shardworker --password=shardworker"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      MYSQL_CONNECTION_STRING: >-
+        Server=localhost;Port=3306;Database=shardworker_test;User=shardworker;Password=shardworker;
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.x
+
+      - name: Download test binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: test-binaries
+          path: ShardWorker.IntegrationTests/bin/Release/net8.0/
+
+      - name: Run tests
+        run: >-
+          dotnet test ShardWorker.IntegrationTests/bin/Release/net8.0/ShardWorker.IntegrationTests.dll
+          --filter "Provider=MySql"
+          --logger "trx;LogFileName=results.trx"
+          --results-directory "${{ github.workspace }}/test-results"
+
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: always()
+        with:
+          name: MySQL
+          path: test-results/results.trx
+          reporter: dotnet-trx
+          fail-on-error: true
