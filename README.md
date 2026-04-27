@@ -74,7 +74,69 @@ Acquire shard 4
 
 Best for continuous polling workloads (e.g. consuming a per-shard queue or scanning a database partition on a schedule).
 
+The worker receives the same shard on every call and uses it as a stable partition key:
+
+```csharp
+// Each shard owns a fixed slice of customers — shard 3 always processes customers where id % 8 == 3.
+// The worker runs on a schedule; the shard never changes hands unless this instance dies.
+public class CustomerSyncWorker : IShardedWorker
+{
+    public async Task ExecuteAsync(ShardContext shard, CancellationToken ct)
+    {
+        var customers = await _db.GetCustomersForShardAsync(shard.Index, shard.Total, ct);
+        foreach (var c in customers)
+            await _sync.SyncAsync(c, ct);
+    }
+}
+
+services.AddShardEngine<CustomerSyncWorker>(
+    opts =>
+    {
+        opts.TotalShards   = 8;
+        opts.WorkerInterval = TimeSpan.FromMinutes(1); // poll every minute per shard
+    },
+    new PostgresShardLockProvider(connectionString, "customer_sync_locks"));
+```
+
 ### Task-queue mode (`ReleaseOnCompletion = true`)
+
+Here each shard represents a **single unit of work** (e.g. one report, one import job). The worker processes it once and returns — the shard is immediately released back to the pool for any instance to pick up next.
+
+The shard index is used to partition pending work — each shard owns a slice of the `reports` table determined by `id % totalShards`:
+
+```sql
+-- GetNextPendingReportAsync: fetch one pending report belonging to this shard
+SELECT TOP 1 id, payload
+FROM reports
+WHERE status = 'pending'
+  AND id % @totalShards = @shardIndex
+ORDER BY created_at
+```
+
+```csharp
+public class ReportGeneratorWorker : IShardedWorker
+{
+    public async Task ExecuteAsync(ShardContext shard, CancellationToken ct)
+    {
+        var report = await _db.GetNextPendingReportAsync(shard.Index, shard.Total, ct);
+        if (report is null) return; // nothing to do — release and move on
+
+        await _generator.GenerateAsync(report, ct);
+        await _db.MarkReportCompleteAsync(report.Id, ct);
+        // returning normally triggers the release
+    }
+}
+
+services.AddShardEngine<ReportGeneratorWorker>(
+    opts =>
+    {
+        opts.TotalShards          = 30;
+        opts.MaxShardsPerInstance = 10;  // hold at most 10 at a time
+        opts.ReleaseOnCompletion  = true; // release after each execution
+        opts.WorkerInterval       = TimeSpan.Zero; // pick up the next shard immediately
+    },
+    new PostgresShardLockProvider(connectionString, "report_locks"));
+```
 
 When `ExecuteAsync` returns normally (without throwing), the shard is released immediately and goes back into the unclaimed pool. The engine then picks up a different unclaimed shard on the next acquire cycle.
 
@@ -130,6 +192,45 @@ With 10 shards and `WorkerConcurrency = 4`, a single instance runs up to **40 co
 `ReleaseOnCompletion` and `ReleaseOnThrows` interact with concurrency as follows:
 - When any slot calls `cts.Cancel()` (via `ReleaseOnCompletion` or `ReleaseOnThrows`), all other slots for that shard observe the cancellation and exit cleanly.
 - The shard is released once **all** slots have exited (the `finally` block in `StartWorker` fires after `Task.WhenAll`).
+
+---
+
+## Partitioning your data
+
+Every worker query uses `id % totalShards = shardIndex` to select only the rows that belong to the current shard. Understanding what makes a good partition key avoids subtle problems.
+
+### Requirements
+
+- **Stable** — the key must never change for the lifetime of a row. If a row's key changes, it silently moves to a different shard and may be missed or double-processed.
+- **Numeric** — modulo requires an integer. Non-numeric keys must be hashed first (see below).
+- **Not necessarily sequential or contiguous** — gaps in the sequence are fine. `id % 8` distributes rows with IDs `1, 5, 100, 10000` just as evenly as `1, 2, 3, 4`.
+
+### Distribution
+
+Modulo partitioning is uniform when keys are roughly evenly distributed across all remainders. This holds for:
+
+- Auto-increment integers (`IDENTITY`, `SERIAL`) — consecutive values cycle through all remainders evenly.
+- Most random / UUID-derived integers — no systematic bias.
+
+It can skew when keys are multiples of `TotalShards` or share a common factor with it. For example, if all IDs happen to be even and `TotalShards = 8`, only even-remainder shards receive work. In practice this is rare with natural keys, but if you observe uneven load, choose a prime `TotalShards` value (e.g. 7, 11, 13) which has no common factors with typical key patterns.
+
+### Non-numeric keys
+
+If your primary key is a string or UUID, hash it to an integer before applying modulo:
+
+```sql
+-- PostgreSQL
+WHERE id % @totalShards = @shardIndex          -- integer PK
+
+-- PostgreSQL with UUID/text PK
+WHERE abs(hashtext(id::text)) % @totalShards = @shardIndex
+
+-- SQL Server with integer PK
+WHERE id % @totalShards = @shardIndex
+
+-- SQL Server with string/uniqueidentifier PK
+WHERE abs(checksum(cast(id as nvarchar(64)))) % @totalShards = @shardIndex
+```
 
 ---
 
