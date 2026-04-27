@@ -98,6 +98,8 @@ With 30 shards, 2 instances, and `MaxShardsPerInstance = 10`:
 
 > If `ExecuteAsync` **throws**, the shard is **not** released — it stays held and retries on the next loop iteration. Only a clean return triggers the release.
 
+> **`MaxShardsPerInstance` is strongly recommended with `ReleaseOnCompletion`.** Without it, an instance has unlimited capacity and will re-acquire every shard it just released on the very next acquire cycle — starving other instances. Setting `MaxShardsPerInstance` to `TotalShards / expectedInstances` ensures released shards stay unclaimed long enough for other instances to compete for them.
+
 ### Error retry mode (`ReleaseOnThrows = true`)
 
 By default, if `ExecuteAsync` throws, the error is logged and the shard is retried after `WorkerInterval`. With `ReleaseOnThrows = true`, the shard is released immediately so **any** instance (not necessarily this one) can attempt it on the next acquire cycle:
@@ -169,7 +171,10 @@ public class OrderWorker : IShardedWorker
         // Each instance owns a slice — only rows where (id % Total == Index) land here.
         //
         //   TotalShards = 8, this instance owns shard 3:
-        //   shard.Index = 3, shard.Total = 8
+        //   shard.Index      = 3           — zero-based shard index owned by this instance
+        //   shard.Total      = 8           — total shards configured for this worker
+        //   shard.InstanceId = "a3f9c2..."  — unique identifier for this running process
+        //   shard.WorkerName = "OrderWorker" — class name of the worker type
         //   → orders with id % 8 == 3  (e.g. 3, 11, 19, 27 …)
 
         var orders = await _orders.GetPendingAsync(
