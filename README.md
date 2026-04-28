@@ -11,17 +11,19 @@ A lightweight .NET library for running distributed, sharded background workers c
 The total workload is divided into **N shards** (numbered `0` to `N-1`). Every running instance continuously tries to acquire shard locks via the configured `IShardLockProvider`. Once a shard is acquired, a worker loop is started for it. A heartbeat loop renews held locks in the background. If a lock renewal fails (e.g. the instance was too slow), the worker for that shard is stopped and the shard becomes available for another instance to claim.
 
 ```
-Instance A                Instance B
-│                         │
-├─ Acquire shard 0 ✓      ├─ Acquire shard 0 ✗ (held by A)
-├─ Acquire shard 1 ✓      ├─ Acquire shard 1 ✗ (held by A)
-├─ Acquire shard 2 ✗      ├─ Acquire shard 2 ✓
-│  ...                    │  ...
-│                         │
-├─ Heartbeat (renew 0,1)  ├─ Heartbeat (renew 2)
-│                         │
-└─ Graceful stop:         └─ Graceful stop:
-   release 0, 1              release 2
+Instance A                  Instance B
+│                           │
+│  (shuffle candidates)     │  (shuffle candidates)
+├─ Acquire shard 3 ✓        ├─ Acquire shard 3 ✗ (held by A)
+├─ Acquire shard 7 ✓        ├─ Acquire shard 7 ✗ (held by A)
+├─ Acquire shard 1 ✓        ├─ Acquire shard 0 ✓
+│                           ├─ Acquire shard 5 ✓
+│                           │  ...
+│                           │
+├─ Heartbeat (renew 3,7,1)  ├─ Heartbeat (renew 0,5)
+│                           │
+└─ Graceful stop:           └─ Graceful stop:
+   release 3, 7, 1             release 0, 5
 ```
 
 Lock rows in the database are the single source of truth. If an instance dies, its lock rows expire naturally after `LockExpiry` and other instances pick up those shards on the next acquire cycle.
@@ -158,7 +160,8 @@ services.AddShardEngine<ReportGeneratorWorker>(
         opts.TotalShards          = 30;
         opts.MaxShardsPerInstance = 10;  // hold at most 10 at a time
         opts.ReleaseOnCompletion  = true; // release after each execution
-        opts.WorkerInterval       = TimeSpan.Zero; // pick up the next shard immediately
+        // WorkerInterval is not applied in task-queue mode — the worker slot exits
+        // immediately after completion. Re-acquire speed is controlled by AcquireInterval.
     },
     new PostgresShardLockProvider(connectionString, "report_locks"));
 ```
@@ -180,9 +183,11 @@ With 30 shards, 2 instances, and `MaxShardsPerInstance = 10`:
 
 | Step | Instance A | Instance B | Unclaimed |
 |---|---|---|---|
-| Startup | Claims 0–9 (10 held) | Claims 10–19 (10 held) | 20–29 |
-| A finishes shard 3 | Releases 3 → holds 9 | Holds 10–19 | 3, 20–29 |
-| Next acquire cycle | Claims shard 20 → back to 10 | Holds 10–19 | 3, 21–29 |
+| Startup | Claims 10 shards e.g. {3,7,1,...} | Claims 10 shards e.g. {0,5,22,...} | Remaining 10 |
+| A finishes shard 3 | Releases 3 → holds 9 | Holds its 10 | 3 + remaining |
+| Next acquire cycle | Claims one unclaimed shard → back to 10 | Holds its 10 | One fewer unclaimed |
+
+> Instances shuffle their candidate list on every acquire cycle, so the specific shard indices claimed at startup are non-deterministic. The table uses placeholder sets to illustrate the cycling pattern.
 | Steady state | 10 held, cycling through pool | 10 held, cycling through pool | Always some unclaimed |
 
 > If `ExecuteAsync` **throws**, the shard is **not** released — it stays held and retries on the next loop iteration. Only a clean return triggers the release.
@@ -429,7 +434,10 @@ All options live in `ShardWorkerOptions`. Each worker type can have its own valu
 | `WorkerIntervalOnThrows` | `null` | Override for `WorkerInterval` used when `ExecuteAsync` throws. `null` falls back to `WorkerInterval`. Use a longer value to add cool-down after failures without slowing the normal cadence |
 | `WorkerConcurrency` | `1` | Number of concurrent `ExecuteAsync` calls per shard. Each slot runs its own independent loop |
 
-> **Rule:** `HeartbeatInterval` must be less than `LockExpiry`. The engine throws at startup if this is violated.
+> **Startup validation rules:** The engine throws `InvalidOperationException` at startup if:
+> - `HeartbeatInterval >= LockExpiry`
+> - `TotalShards <= 0`
+> - `WorkerConcurrency <= 0`
 
 ---
 
@@ -614,11 +622,20 @@ public sealed class AlertingObserver : IShardEngineObserver
 }
 ```
 
+**Without metrics** — register before `AddShardEngine` so the null observer registered by `AddShardEngine` (`TryAddSingleton`) is skipped:
+
 ```csharp
-// Register before AddShardEngine — the null observer registered by AddShardEngine is
-// skipped (TryAddSingleton) when a real observer is already present.
 services.AddSingleton<IShardEngineObserver, AlertingObserver>();
 services.AddShardEngine<OrderWorker>(opts => { ... }, provider);
+```
+
+**With metrics** — use `AddShardEngineObserver<T>()` from `ShardWorker.Observability` instead, which composes your observer alongside `MetricsShardEngineObserver` so both receive every event:
+
+```csharp
+using ShardWorker.Observability;
+
+builder.Services.AddShardWorkerMetrics();
+builder.Services.AddShardEngineObserver<AlertingObserver>(); // stacked on top of metrics
 ```
 
 > **All observer methods are called on background threads.** Implementations must be thread-safe and must not throw — any exception is silently swallowed to protect the engine loop.
