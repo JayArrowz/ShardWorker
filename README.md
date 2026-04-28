@@ -38,6 +38,8 @@ The acquire and heartbeat loops are both **O(1) DB round-trips** regardless of `
 
 There is no hard ceiling on `TotalShards`. Values in the tens of thousands are practical.
 
+> **Shards are buckets, not items.** `TotalShards` does not need to grow as your data grows. With `TotalShards = 30` and 100 million users, each shard simply processes ~3.3 million users. Shards get busier over time — they do not multiply. Size `TotalShards` for the maximum number of instances you ever want to run, not for the number of rows in your table.
+
 ### Instance count
 
 Each instance independently competes for unclaimed shards. Adding instances automatically redistributes ownership — no coordination layer is needed. Instances that die release their shards via lock expiry; instances that restart reclaim shards on the next acquire cycle.
@@ -226,6 +228,32 @@ With 10 shards and `WorkerConcurrency = 4`, a single instance runs up to **40 co
 ## Partitioning your data
 
 Every worker query uses `id % totalShards = shardIndex` to select only the rows that belong to the current shard. Understanding what makes a good partition key avoids subtle problems.
+
+### Sizing `TotalShards`
+
+`TotalShards` is the number of **buckets**, not a capacity limit. Every row, no matter when it was created, maps to one of the existing buckets:
+
+```
+TotalShards = 30
+
+User 1        →     1 % 30 = shard 1
+User 31       →    31 % 30 = shard 1   ← same bucket, more work inside it
+User 10,000   → 10000 % 30 = shard 10
+User 100,000  → 100000 % 30 = shard 10 ← same bucket, even more work
+```
+
+As data grows, each shard processes more rows per execution — but the number of shards stays the same. Size `TotalShards` for the maximum number of instances you would ever want to run:
+
+| Expected max instances | Suggested `TotalShards` |
+|---|---|
+| 1–3 | 10–30 |
+| 5–10 | 50–100 |
+| 10–50 | 100–500 |
+| 50+ | 500–1 000 |
+
+There is no cost to choosing a larger value — pick headroom now rather than changing it later.
+
+> **Changing `TotalShards` is a breaking migration.** Every row's shard assignment changes (`userId % 30` vs `userId % 60`), which can cause rows to be missed or double-processed during the transition. Treat it like a database schema change: plan it deliberately, don't let it creep up on you.
 
 ### Requirements
 
