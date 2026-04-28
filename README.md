@@ -170,7 +170,14 @@ By default, if `ExecuteAsync` throws, the error is logged and the shard is retri
 opts.ReleaseOnThrows = true;
 ```
 
-Combine with `ReleaseOnCompletion` to get a pure task-queue where every execution — successful or not — returns the shard to the pool.
+If you want the same instance to keep the shard but back off longer after a failure, use `WorkerIntervalOnThrows`:
+
+```csharp
+opts.WorkerInterval          = TimeSpan.FromSeconds(30); // normal cadence
+opts.WorkerIntervalOnThrows  = TimeSpan.FromMinutes(5);  // cool-down after an exception
+```
+
+This is independent of `ReleaseOnThrows` — if `ReleaseOnThrows = true`, the shard is released and `WorkerIntervalOnThrows` has no effect.
 
 ### Parallel execution (`WorkerConcurrency > 1`)
 
@@ -240,6 +247,7 @@ WHERE abs(checksum(cast(id as nvarchar(64)))) % @totalShards = @shardIndex
 |---|---|---|
 | `ShardWorker.Core` | `netstandard2.0` | Interfaces and models — no dependencies |
 | `ShardWorker` | `netstandard2.0` | Engine and DI registration |
+| `ShardWorker.Observability` | `net8.0;net9.0;net10.0` | Optional: `System.Diagnostics.Metrics` counters + DI helpers |
 | `ShardWorker.Providers.InMemory` | `netstandard2.0` | In-process lock provider for testing |
 | `ShardWorker.Providers.Postgres` | `net8.0;net9.0;net10.0` | PostgreSQL lock provider via Npgsql |
 | `ShardWorker.Providers.MsSql` | `net8.0;net9.0;net10.0` | SQL Server lock provider via Microsoft.Data.SqlClient |
@@ -365,6 +373,7 @@ All options live in `ShardWorkerOptions`. Each worker type can have its own valu
 | `MaxShardsPerInstance` | unlimited | Maximum shards one instance will hold at once. Other shards remain unclaimed for other instances |
 | `ReleaseOnCompletion` | `false` | When `true`, a shard is released immediately after `ExecuteAsync` returns normally — enabling task-queue style processing |
 | `ReleaseOnThrows` | `false` | When `true`, a shard is released immediately after `ExecuteAsync` throws, so another instance can retry it |
+| `WorkerIntervalOnThrows` | `null` | Override for `WorkerInterval` used when `ExecuteAsync` throws. `null` falls back to `WorkerInterval`. Use a longer value to add cool-down after failures without slowing the normal cadence |
 | `WorkerConcurrency` | `1` | Number of concurrent `ExecuteAsync` calls per shard. Each slot runs its own independent loop |
 
 > **Rule:** `HeartbeatInterval` must be less than `LockExpiry`. The engine throws at startup if this is violated.
@@ -507,3 +516,159 @@ On `IHost` shutdown the engine:
 2. Cancels each held shard's `CancellationTokenSource` — worker loops exit after the current `ExecuteAsync` call completes.
 3. Each worker task releases its shard lock before finishing (5 s timeout). Released locks are immediately available to other instances rather than waiting to expire.
 4. `StopAsync` waits up to `ShutdownTimeout` for all tasks; if exceeded it logs a warning and returns — remaining locks expire naturally.
+
+---
+
+## Observability
+
+`ShardWorker` fires structured log messages at every significant lifecycle event (acquire, release, stolen lock, worker fault). For metric-level telemetry, add the optional `ShardWorker.Observability` package which publishes counters via `System.Diagnostics.Metrics` — compatible with OpenTelemetry, Prometheus exporters, and `dotnet-counters`.
+
+### Metrics
+
+```csharp
+using ShardWorker.Observability;
+
+builder.Services.AddShardWorkerMetrics();
+```
+
+This registers `MetricsShardEngineObserver` and exposes the following counters under the meter name **`ShardWorker`**:
+
+| Instrument | Kind | Description |
+|---|---|---|
+| `shardworker.shards.acquired` | Counter | Shard lock acquired by this instance |
+| `shardworker.shards.released` | Counter | Shard lock released by this instance |
+| `shardworker.shards.stolen` | Counter | Heartbeat detected a stolen shard |
+| `shardworker.worker.faults` | Counter | `ExecuteAsync` threw an unhandled exception |
+
+All counters carry `worker` (worker type name) and `instance_id` tags.
+
+### Custom observer
+
+Implement `IShardEngineObserver` from `ShardWorker.Core` and register it with DI:
+
+```csharp
+public sealed class AlertingObserver : IShardEngineObserver
+{
+    private readonly IAlertService _alerts;
+    public AlertingObserver(IAlertService alerts) => _alerts = alerts;
+
+    public void OnShardAcquired(string workerName, string instanceId, int shardIndex) { }
+    public void OnShardReleased(string workerName, string instanceId, int shardIndex) { }
+    public void OnShardStolen(string workerName, string instanceId, int shardIndex) =>
+        _alerts.Warn($"{workerName} shard {shardIndex} was stolen from {instanceId}");
+    public void OnWorkerFaulted(string workerName, string instanceId, int shardIndex, Exception exception) =>
+        _alerts.Error($"{workerName} shard {shardIndex} faulted", exception);
+}
+```
+
+```csharp
+// Register before AddShardEngine — the null observer registered by AddShardEngine is
+// skipped (TryAddSingleton) when a real observer is already present.
+services.AddSingleton<IShardEngineObserver, AlertingObserver>();
+services.AddShardEngine<OrderWorker>(opts => { ... }, provider);
+```
+
+> **All observer methods are called on background threads.** Implementations must be thread-safe and must not throw — any exception is silently swallowed to protect the engine loop.
+
+### .NET Aspire
+
+Aspire's `AddServiceDefaults()` already configures an OpenTelemetry pipeline with an OTLP exporter pointing at the Aspire dashboard. You only need to register the ShardWorker metrics observer and add its meter to the existing pipeline:
+
+```csharp
+// Program.cs in your Worker Service / API project
+using ShardWorker.Observability;
+
+builder.AddServiceDefaults(); // sets up OTLP exporter, tracing, etc.
+
+builder.Services.AddShardWorkerMetrics(); // registers MetricsShardEngineObserver
+
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics => metrics.AddMeter(MetricsShardEngineObserver.MeterName));
+```
+
+`AddServiceDefaults()` is generated by the Aspire workload into your project's `ServiceDefaults/Extensions.cs`. It calls `WithMetrics()` internally, so the `.AddOpenTelemetry().WithMetrics(...)` call above merges into the same pipeline — no duplicate exporters are created.
+
+After this, the four ShardWorker counters (`shardworker.shards.acquired`, `shardworker.shards.released`, `shardworker.shards.stolen`, `shardworker.worker.faults`) appear in the Aspire dashboard's Metrics tab, tagged by `worker` and `instance_id`.
+
+---
+
+## Worker patterns
+
+The library handles shard distribution and locking. Retry strategies, dead-letter queues, and delayed dispatch are implemented inside `ExecuteAsync` — no library primitives are needed.
+
+### Exponential backoff
+
+Track consecutive failures in the worker and delay accordingly. The shard lock is held throughout, so other instances will not steal the shard while you are backing off:
+
+```csharp
+public class RetryWorker : IShardedWorker
+{
+    private readonly Dictionary<int, int> _failures = new();
+
+    public async Task ExecuteAsync(ShardContext shard, CancellationToken ct)
+    {
+        var consecutive = _failures.GetValueOrDefault(shard.Index);
+        if (consecutive > 0)
+        {
+            var backoff = TimeSpan.FromSeconds(Math.Min(Math.Pow(2, consecutive), 300));
+            await Task.Delay(backoff, ct);
+        }
+
+        try
+        {
+            await DoWorkAsync(shard, ct);
+            _failures[shard.Index] = 0; // reset on success
+        }
+        catch
+        {
+            _failures[shard.Index] = consecutive + 1;
+            throw; // engine will log it; WorkerIntervalOnThrows adds further cool-down if set
+        }
+    }
+}
+```
+
+For a simpler approach, set `WorkerIntervalOnThrows` to a longer delay — the engine applies it automatically after any exception:
+
+```csharp
+opts.WorkerInterval         = TimeSpan.FromSeconds(10);
+opts.WorkerIntervalOnThrows = TimeSpan.FromMinutes(5);
+```
+
+### Dead-letter queue
+
+The exact shape of a dead-letter implementation depends on your domain model — specifically, whether your rows track attempt counts, whether failures are stored in-band (a `status` column) or out-of-band (a separate table), and whether failed items should be requeued manually or archived. The pattern below assumes an `attempt_count` column on the work item and a separate dead-letter table, which is a common starting point:
+
+```csharp
+public async Task ExecuteAsync(ShardContext shard, CancellationToken ct)
+{
+    var items = await _repo.GetPendingAsync(shard.Index, shard.Total, ct);
+    foreach (var item in items)
+    {
+        if (item.AttemptCount >= 5)
+        {
+            await _repo.MoveToDeadLetterAsync(item, ct);
+            continue;
+        }
+
+        try   { await ProcessAsync(item, ct); }
+        catch { await _repo.IncrementAttemptsAsync(item, ct); }
+    }
+}
+```
+
+Adapt this to your own model — for example, using a `status` column (`'pending'` → `'failed'` → `'dead'`) instead of a separate table, or storing the last exception message alongside the attempt count for observability.
+
+### Delayed / scheduled dispatch
+
+To process a row only after a specific time, add a `process_after` column and filter on it in your query:
+
+```sql
+SELECT * FROM jobs
+WHERE status = 'pending'
+  AND id % @totalShards = @shardIndex
+  AND process_after <= NOW()
+ORDER BY process_after
+```
+
+The shard poll cadence (`WorkerInterval`) becomes the scheduling resolution — a row with `process_after = NOW() + 30s` will be picked up within one `WorkerInterval` after its scheduled time.

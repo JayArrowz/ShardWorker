@@ -1,4 +1,5 @@
-﻿using Microsoft.Extensions.Hosting;
+﻿#nullable enable
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using ShardWorker.Core.Interface;
@@ -25,6 +26,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
     private readonly TWorker _worker;
     private readonly ShardWorkerOptions _opts;
     private readonly ILogger<ShardEngine<TWorker>> _logger;
+    private readonly IShardEngineObserver? _observer;
     private readonly string _workerName = typeof(TWorker).Name;
     private readonly string _instanceId = Guid.NewGuid().ToString("N")[..12];
 
@@ -35,13 +37,21 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         IShardLockProvider<TWorker> provider,
         TWorker worker,
         IOptionsMonitor<ShardWorkerOptions> optionsMonitor,
-        ILogger<ShardEngine<TWorker>> logger)
+        ILogger<ShardEngine<TWorker>> logger,
+        IShardEngineObserver? observer = null)
     {
         _provider = provider;
         _worker = worker;
         _opts = optionsMonitor.Get(typeof(TWorker).Name);
         _logger = logger;
+        _observer = observer;
 
+        if (_opts.TotalShards <= 0)
+            throw new InvalidOperationException(
+                $"[{_workerName}] TotalShards must be greater than zero (got {_opts.TotalShards}).");
+        if (_opts.WorkerConcurrency <= 0)
+            throw new InvalidOperationException(
+                $"[{_workerName}] WorkerConcurrency must be greater than zero (got {_opts.WorkerConcurrency}).");
         if (_opts.HeartbeatInterval >= _opts.LockExpiry)
             throw new InvalidOperationException(
                 $"[{_workerName}] HeartbeatInterval ({_opts.HeartbeatInterval}) must be less than LockExpiry ({_opts.LockExpiry}).");
@@ -124,6 +134,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                         {
                             _logger.LogWarning("[{Worker}:{Id}] Shard {Shard} renewal failed — stopping worker",
                                 _workerName, _instanceId, shardIndex);
+                            TryNotify(() => _observer?.OnShardStolen(_workerName, _instanceId, shardIndex));
                             StopWorker(shardIndex);
                         }
                     }
@@ -147,7 +158,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         {
             try
             {
-                var slotCount = Math.Max(1, _opts.WorkerConcurrency);
+                var slotCount = _opts.WorkerConcurrency;
                 var slots = new Task[slotCount];
                 for (int i = 0; i < slotCount; i++)
                     slots[i] = RunWorkerSlotAsync(context, cts, shardIndex);
@@ -167,6 +178,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                     _logger.LogWarning(ex, "[{Worker}:{Id}] Release failed for shard {Shard} (will expire naturally)",
                         _workerName, _instanceId, shardIndex);
                 }
+                TryNotify(() => _observer?.OnShardReleased(_workerName, _instanceId, shardIndex));
             }
         }, CancellationToken.None);
 
@@ -174,6 +186,11 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         {
             cts.Cancel();
             cts.Dispose();
+        }
+        else
+        {
+            _logger.LogInformation("[{Worker}:{Id}] Acquired shard {Shard}", _workerName, _instanceId, shardIndex);
+            TryNotify(() => _observer?.OnShardAcquired(_workerName, _instanceId, shardIndex));
         }
     }
 
@@ -192,6 +209,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             {
                 _logger.LogError(ex, "[{Worker}:{Id}] Worker threw on shard {Shard}",
                     _workerName, _instanceId, shardIndex);
+                TryNotify(() => _observer?.OnWorkerFaulted(_workerName, _instanceId, shardIndex, ex));
             }
 
             if (completed && _opts.ReleaseOnCompletion)
@@ -210,9 +228,16 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                 break;
             }
 
-            try { await Task.Delay(_opts.WorkerInterval, cts.Token); }
+            var delay = completed ? _opts.WorkerInterval : (_opts.WorkerIntervalOnThrows ?? _opts.WorkerInterval);
+            try { await Task.Delay(delay, cts.Token); }
             catch (OperationCanceledException) { break; }
         }
+    }
+
+    private static void TryNotify(Action action)
+    {
+        try { action(); }
+        catch { /* observers must not crash the engine */ }
     }
 
     private void StopWorker(int shardIndex)
@@ -237,13 +262,11 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         try
         {
             var allDone = Task.WhenAll(tasks);
-            var timeout = Task.Delay(_opts.ShutdownTimeout);
-            await Task.WhenAny(allDone, timeout);
+            var timeout = Task.Delay(_opts.ShutdownTimeout, cancellationToken);
+            if (await Task.WhenAny(allDone, timeout) != allDone)
+                _logger.LogWarning("[{Worker}:{Id}] Shutdown timed out; some locks will expire naturally",
+                    _workerName, _instanceId);
         }
-        catch (OperationCanceledException)
-        {
-            _logger.LogWarning("[{Worker}:{Id}] Shutdown timed out; some locks will expire naturally",
-                _workerName, _instanceId);
-        }
+        catch (OperationCanceledException) { /* host forced abort — exit immediately */ }
     }
 }

@@ -61,6 +61,18 @@ public sealed class ShardWorkerOptions
     public bool ReleaseOnThrows { get; set; } = false;
 
     /// <summary>
+    /// How long to wait before retrying a shard after <see cref="IShardedWorker.ExecuteAsync"/>
+    /// throws an unhandled exception. When <c>null</c>, falls back to <see cref="WorkerInterval"/>.
+    /// <para>
+    /// Use this to apply a longer backoff on failure without slowing down the normal execution
+    /// cadence, and to avoid hot exception loops hammering the database.
+    /// </para>
+    /// Has no effect when <see cref="ReleaseOnThrows"/> is <c>true</c> (the shard is released
+    /// rather than retried).
+    /// </summary>
+    public TimeSpan? WorkerIntervalOnThrows { get; set; } = null;
+
+    /// <summary>
     /// Number of concurrent <see cref="IShardedWorker.ExecuteAsync"/> calls to run in parallel
     /// per shard. Each slot runs its own independent execution loop on the same
     /// <see cref="ShardContext"/>.

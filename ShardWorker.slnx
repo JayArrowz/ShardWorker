@@ -5,5 +5,6 @@
   <Project Path="ShardWorker.Providers.MySql/ShardWorker.Providers.MySql.csproj" />
   <Project Path="ShardWorker.Providers.Postgres/ShardWorker.Providers.Postgres.csproj" />
   <Project Path="ShardWorker/ShardWorker.csproj" />
+  <Project Path="ShardWorker.Observability/ShardWorker.Observability.csproj" />
   <Project Path="ShardWorker.IntegrationTests/ShardWorker.IntegrationTests.csproj" />
 </Solution>

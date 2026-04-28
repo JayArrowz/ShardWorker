@@ -27,6 +27,7 @@ public static class ShardEngineServiceCollectionExtensions
         services.TryAddSingleton<TWorker>();
         services.AddSingleton<IShardLockProvider<TWorker>>(sp =>
             new TypedShardLockProvider<TWorker>(lockProviderFactory(sp)));
+        services.TryAddSingleton<IShardEngineObserver, NullShardEngineObserver>();
         services.AddHostedService<ShardEngine<TWorker>>();
         return services;
     }

@@ -9,7 +9,7 @@ using Xunit;
 
 namespace ShardWorker.IntegrationTests.Engine;
 
-public sealed class ShardEngineTests
+public sealed partial class ShardEngineTests
 {
     private static IHost BuildHost<TWorker>(
         TWorker worker,
@@ -36,53 +36,6 @@ public sealed class ShardEngineTests
             if (DateTime.UtcNow > deadline)
                 throw new TimeoutException($"Condition not met within {timeoutMs} ms.");
             await Task.Delay(pollMs);
-        }
-    }
-
-    private sealed class CountingWorker : IShardedWorker
-    {
-        private int _count;
-        public int Count => _count;
-        public ConcurrentBag<int> SeenShards { get; } = new();
-
-        public Task ExecuteAsync(ShardContext ctx, CancellationToken ct)
-        {
-            Interlocked.Increment(ref _count);
-            SeenShards.Add(ctx.Index);
-            return Task.CompletedTask;
-        }
-    }
-
-    private sealed class ThrowingWorker : IShardedWorker
-    {
-        private int _calls;
-        public int Calls => _calls;
-
-        public Task ExecuteAsync(ShardContext ctx, CancellationToken ct)
-        {
-            Interlocked.Increment(ref _calls);
-            throw new InvalidOperationException("deliberate failure");
-        }
-    }
-
-    // Two distinct types needed for the multi-worker isolation test.
-    private sealed class WorkerAlpha : IShardedWorker
-    {
-        public ConcurrentBag<int> SeenShards { get; } = new();
-        public Task ExecuteAsync(ShardContext ctx, CancellationToken ct)
-        {
-            SeenShards.Add(ctx.Index);
-            return Task.CompletedTask;
-        }
-    }
-
-    private sealed class WorkerBeta : IShardedWorker
-    {
-        public ConcurrentBag<int> SeenShards { get; } = new();
-        public Task ExecuteAsync(ShardContext ctx, CancellationToken ct)
-        {
-            SeenShards.Add(ctx.Index);
-            return Task.CompletedTask;
         }
     }
 
@@ -413,50 +366,172 @@ public sealed class ShardEngineTests
         Assert.Equal(new[] { 0, 1, 2, 3, 4 }, betaWorker.SeenShards.Distinct().OrderBy(x => x).ToArray());
     }
 
-    private sealed class LambdaWorker : IShardedWorker
+    [Fact]
+    public async Task Engine_WorkerIntervalOnThrows_UsesLongerDelayAfterException()
     {
-        private readonly Func<ShardContext, CancellationToken, Task> _execute;
+        // With WorkerIntervalOnThrows much longer than WorkerInterval, after a throw the shard
+        // must NOT be re-executed within WorkerInterval-time but MUST be re-executed within
+        // WorkerIntervalOnThrows-time.
 
-        public LambdaWorker(Func<ShardContext, CancellationToken, Task> execute)
-            => _execute = execute;
+        var callTimes = new ConcurrentBag<DateTime>();
+        var worker = new LambdaWorker((ctx, ct) =>
+        {
+            callTimes.Add(DateTime.UtcNow);
+            throw new InvalidOperationException("deliberate");
+        });
 
-        public Task ExecuteAsync(ShardContext ctx, CancellationToken ct)
-            => _execute(ctx, ct);
+        var provider = new InMemoryShardLockProvider();
+        using var host = BuildHost(worker, provider, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(50);
+            opts.WorkerIntervalOnThrows = TimeSpan.FromMilliseconds(500);
+            opts.AcquireInterval = TimeSpan.FromMilliseconds(50);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(500);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+        });
+
+        await host.StartAsync();
+
+        // Wait for at least two calls so we can measure the gap
+        await WaitForAsync(() => callTimes.Count >= 2, timeoutMs: 5000);
+
+        await host.StopAsync();
+
+        // Gap between first and second call must be ≥ WorkerIntervalOnThrows (500 ms),
+        // not the short WorkerInterval (50 ms).
+        var ordered = callTimes.OrderBy(t => t).ToList();
+        var gap = ordered[1] - ordered[0];
+        Assert.True(gap >= TimeSpan.FromMilliseconds(400),
+            $"Expected ≥ 400 ms between calls after throw, but gap was {gap.TotalMilliseconds:F0} ms");
     }
 
-    /// <summary>
-    /// Wraps a provider and returns empty from RenewManyAsync after
-    /// <paramref name="allowedRenews"/> successful renewals, simulating a stolen lock.
-    /// </summary>
-    private sealed class FailAfterNthRenewProvider : IShardLockProvider
+    private static IHost BuildHostWithObserver<TWorker>(
+        TWorker worker,
+        IShardLockProvider provider,
+        RecordingObserver observer,
+        Action<ShardWorkerOptions> configure)
+        where TWorker : class, IShardedWorker
     {
-        private readonly IShardLockProvider _inner;
-        private readonly int _allowedRenews;
-        private int _renewCount;
+        return new HostBuilder()
+            .ConfigureServices(services =>
+            {
+                services.AddLogging(b => b.SetMinimumLevel(LogLevel.Warning));
+                services.AddSingleton(worker);
+                services.AddSingleton<IShardEngineObserver>(observer);
+                services.AddShardEngine<TWorker>(configure, provider);
+            })
+            .Build();
+    }
 
-        public FailAfterNthRenewProvider(IShardLockProvider inner, int allowedRenews)
+    [Fact]
+    public async Task Observer_OnShardAcquired_CalledWhenShardAcquired()
+    {
+        var worker = new CountingWorker();
+        var provider = new InMemoryShardLockProvider();
+        var observer = new RecordingObserver();
+        using var host = BuildHostWithObserver(worker, provider, observer, opts =>
         {
-            _inner = inner;
-            _allowedRenews = allowedRenews;
-        }
+            opts.TotalShards = 2;
+            opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(50);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(500);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+        });
 
-        public Task EnsureSchemaAsync(CancellationToken ct = default)
-            => _inner.EnsureSchemaAsync(ct);
+        await host.StartAsync();
+        await WaitForAsync(() => observer.Events.Count(e => e.Event == "Acquired") >= 2);
+        await host.StopAsync();
 
-        public Task<IReadOnlyList<int>> TryAcquireManyAsync(
-            IReadOnlyList<int> candidates, string instanceId, TimeSpan expiry, CancellationToken ct = default)
-            => _inner.TryAcquireManyAsync(candidates, instanceId, expiry, ct);
+        var acquired = observer.Events.Where(e => e.Event == "Acquired").ToList();
+        Assert.True(acquired.Count >= 2);
+        Assert.All(acquired, e => Assert.Equal(nameof(CountingWorker), e.Worker));
+        Assert.Contains(acquired, e => e.Shard == 0);
+        Assert.Contains(acquired, e => e.Shard == 1);
+    }
 
-        public Task<IReadOnlyList<int>> RenewManyAsync(
-            IReadOnlyList<int> held, string instanceId, TimeSpan expiry, CancellationToken ct = default)
+    [Fact]
+    public async Task Observer_OnShardReleased_CalledOnShutdown()
+    {
+        var worker = new CountingWorker();
+        var provider = new InMemoryShardLockProvider();
+        var observer = new RecordingObserver();
+        using var host = BuildHostWithObserver(worker, provider, observer, opts =>
         {
-            if (Interlocked.Increment(ref _renewCount) > _allowedRenews)
-                return Task.FromResult<IReadOnlyList<int>>(Array.Empty<int>());
-            return _inner.RenewManyAsync(held, instanceId, expiry, ct);
-        }
+            opts.TotalShards = 1;
+            opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(50);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(500);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+        });
 
-        public Task ReleaseManyAsync(
-            IReadOnlyList<int> shards, string instanceId, CancellationToken ct = default)
-            => _inner.ReleaseManyAsync(shards, instanceId, ct);
+        await host.StartAsync();
+        await WaitForAsync(() => observer.Events.Any(e => e.Event == "Acquired"));
+        await host.StopAsync();
+
+        Assert.Contains(observer.Events, e => e.Event == "Released");
+    }
+
+    [Fact]
+    public async Task Observer_OnWorkerFaulted_CalledWhenExecuteAsyncThrows()
+    {
+        var worker = new LambdaWorker((ctx, ct) =>
+        {
+            throw new InvalidOperationException("deliberate");
+        });
+        var provider = new InMemoryShardLockProvider();
+        var observer = new RecordingObserver();
+        using var host = BuildHostWithObserver(worker, provider, observer, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(50);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(500);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+        });
+
+        await host.StartAsync();
+        await WaitForAsync(() => observer.Events.Any(e => e.Event == "Faulted"));
+        await host.StopAsync();
+
+        var faulted = observer.Events.First(e => e.Event == "Faulted");
+        Assert.Equal(nameof(LambdaWorker), faulted.Worker);
+        Assert.Equal(0, faulted.Shard);
+    }
+
+    [Fact]
+    public async Task Observer_OnShardStolen_CalledWhenHeartbeatDetectsSteal()
+    {
+        // Simulate a stolen lock by wrapping the provider so RenewManyAsync returns empty
+        // after the first renewal.
+        var inner = new InMemoryShardLockProvider();
+        var failProvider = new FailAfterNthRenewProvider(inner, allowedRenews: 1);
+
+        var worker = new CountingWorker();
+        var observer = new RecordingObserver();
+
+        using var host = new HostBuilder()
+            .ConfigureServices(services =>
+            {
+                services.AddLogging(b => b.SetMinimumLevel(LogLevel.Warning));
+                services.AddSingleton(worker);
+                services.AddSingleton<IShardEngineObserver>(observer);
+                services.AddShardEngine<CountingWorker>(opts =>
+                {
+                    opts.TotalShards = 1;
+                    opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+                    opts.WorkerInterval = TimeSpan.FromMilliseconds(50);
+                    opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
+                    opts.LockExpiry = TimeSpan.FromSeconds(30);
+                }, failProvider);
+            })
+            .Build();
+
+        await host.StartAsync();
+        await WaitForAsync(() => observer.Events.Any(e => e.Event == "Stolen"), timeoutMs: 5000);
+        await host.StopAsync();
+
+        Assert.Contains(observer.Events, e => e.Event == "Stolen");
     }
 }
+
