@@ -622,20 +622,20 @@ public sealed class AlertingObserver : IShardEngineObserver
 }
 ```
 
-**Without metrics** — register before `AddShardEngine` so the null observer registered by `AddShardEngine` (`TryAddSingleton`) is skipped:
+**Without metrics** — register your observer as `IShardEngineObserver` before or after `AddShardEngine` (order does not matter):
 
 ```csharp
 services.AddSingleton<IShardEngineObserver, AlertingObserver>();
 services.AddShardEngine<OrderWorker>(opts => { ... }, provider);
 ```
 
-**With metrics** — use `AddShardEngineObserver<T>()` from `ShardWorker.Observability` instead, which composes your observer alongside `MetricsShardEngineObserver` so both receive every event:
+**With metrics** — use `AddShardEngineObserver<T>()` from `ShardWorker.Observability`; all registered `IShardEngineObserver` implementations receive every event:
 
 ```csharp
 using ShardWorker.Observability;
 
 builder.Services.AddShardWorkerMetrics();
-builder.Services.AddShardEngineObserver<AlertingObserver>(); // stacked on top of metrics
+builder.Services.AddShardEngineObserver<AlertingObserver>();
 ```
 
 > **All observer methods are called on background threads.** Implementations must be thread-safe and must not throw — any exception is silently swallowed to protect the engine loop.

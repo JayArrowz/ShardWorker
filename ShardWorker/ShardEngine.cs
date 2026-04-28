@@ -26,10 +26,10 @@ public sealed class ShardEngine<TWorker> : BackgroundService
     private readonly TWorker _worker;
     private readonly ShardWorkerOptions _opts;
     private readonly ILogger<ShardEngine<TWorker>> _logger;
-    private readonly IShardEngineObserver? _observer;
+    private readonly IReadOnlyList<IShardEngineObserver> _observers;
     private readonly string _workerName = typeof(TWorker).Name;
     private readonly string _instanceId = Guid.NewGuid().ToString("N")[..12];
-    private readonly Random _rng = new Random();
+    private readonly Random _rng = new();
 
     // shardIndex → (worker CTS, worker Task)
     private readonly ConcurrentDictionary<int, (CancellationTokenSource Cts, Task Task)> _held = new();
@@ -39,13 +39,13 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         TWorker worker,
         IOptionsMonitor<ShardWorkerOptions> optionsMonitor,
         ILogger<ShardEngine<TWorker>> logger,
-        IShardEngineObserver? observer = null)
+        IEnumerable<IShardEngineObserver> observers)
     {
         _provider = provider;
         _worker = worker;
         _opts = optionsMonitor.Get(typeof(TWorker).Name);
         _logger = logger;
-        _observer = observer;
+        _observers = observers.ToList();
 
         if (_opts.TotalShards <= 0)
             throw new InvalidOperationException(
@@ -89,7 +89,8 @@ public sealed class ShardEngine<TWorker> : BackgroundService
 
             for (int i = candidates.Count - 1; i > 0; i--)
             {
-                int j = _rng.Next(i + 1);
+                int j;
+                lock (_rng) { j = _rng.Next(i + 1); }
                 (candidates[i], candidates[j]) = (candidates[j], candidates[i]);
             }
 
@@ -102,10 +103,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                 {
                     var acquired = await _provider.TryAcquireManyAsync(candidates, _instanceId, _opts.LockExpiry, ct);
                     foreach (var shardIndex in acquired)
-                    {
-                        _logger.LogInformation("[{Worker}:{Id}] Acquired shard {Shard}", _workerName, _instanceId, shardIndex);
                         StartWorker(shardIndex, ct);
-                    }
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
@@ -141,7 +139,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                         {
                             _logger.LogWarning("[{Worker}:{Id}] Shard {Shard} renewal failed — stopping worker",
                                 _workerName, _instanceId, shardIndex);
-                            TryNotify(() => _observer?.OnShardStolen(_workerName, _instanceId, shardIndex));
+                            TryNotify(o => o.OnShardStolen(_workerName, _instanceId, shardIndex));
                             StopWorker(shardIndex);
                         }
                     }
@@ -173,19 +171,22 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             }
             finally
             {
-                _held.TryRemove(shardIndex, out _);
-                try
+                var wasOwned = _held.TryRemove(shardIndex, out _);
+                if (wasOwned)
                 {
-                    using var releaseCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    await _provider.ReleaseManyAsync(new[] { shardIndex }, _instanceId, releaseCts.Token);
-                    _logger.LogInformation("[{Worker}:{Id}] Released shard {Shard}", _workerName, _instanceId, shardIndex);
+                    try
+                    {
+                        using var releaseCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                        await _provider.ReleaseManyAsync(new[] { shardIndex }, _instanceId, releaseCts.Token);
+                        _logger.LogInformation("[{Worker}:{Id}] Released shard {Shard}", _workerName, _instanceId, shardIndex);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "[{Worker}:{Id}] Release failed for shard {Shard} (will expire naturally)",
+                            _workerName, _instanceId, shardIndex);
+                    }
+                    TryNotify(o => o.OnShardReleased(_workerName, _instanceId, shardIndex));
                 }
-                catch (Exception ex)
-                {
-                    _logger.LogWarning(ex, "[{Worker}:{Id}] Release failed for shard {Shard} (will expire naturally)",
-                        _workerName, _instanceId, shardIndex);
-                }
-                TryNotify(() => _observer?.OnShardReleased(_workerName, _instanceId, shardIndex));
             }
         }, CancellationToken.None);
 
@@ -197,7 +198,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         else
         {
             _logger.LogInformation("[{Worker}:{Id}] Acquired shard {Shard}", _workerName, _instanceId, shardIndex);
-            TryNotify(() => _observer?.OnShardAcquired(_workerName, _instanceId, shardIndex));
+            TryNotify(o => o.OnShardAcquired(_workerName, _instanceId, shardIndex));
         }
     }
 
@@ -216,7 +217,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             {
                 _logger.LogError(ex, "[{Worker}:{Id}] Worker threw on shard {Shard}",
                     _workerName, _instanceId, shardIndex);
-                TryNotify(() => _observer?.OnWorkerFaulted(_workerName, _instanceId, shardIndex, ex));
+                TryNotify(o => o.OnWorkerFaulted(_workerName, _instanceId, shardIndex, ex));
             }
 
             if (completed && _opts.ReleaseOnCompletion)
@@ -241,10 +242,13 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         }
     }
 
-    private static void TryNotify(Action action)
+    private void TryNotify(Action<IShardEngineObserver> action)
     {
-        try { action(); }
-        catch { /* observers must not crash the engine */ }
+        foreach (var observer in _observers)
+        {
+            try { action(observer); }
+            catch { /* observers must not crash the engine */ }
+        }
     }
 
     private void StopWorker(int shardIndex)

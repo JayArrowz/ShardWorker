@@ -532,6 +532,7 @@ public sealed partial class ShardEngineTests
         await host.StopAsync();
 
         Assert.Contains(observer.Events, e => e.Event == "Stolen");
+        Assert.DoesNotContain(observer.Events, e => e.Event == "Released");
     }
 
     [Fact]

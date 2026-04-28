@@ -16,15 +16,6 @@ public static class ShardWorkerObservabilityServiceCollectionExtensions
     {
         services.AddSingleton<MetricsShardEngineObserver>();
         services.AddSingleton<IShardEngineObserver>(sp => sp.GetRequiredService<MetricsShardEngineObserver>());
-        services.AddSingleton<IShardEngineObserver>(sp =>
-        {
-            var all = sp.GetServices<IShardEngineObserver>();
-            var list = new List<IShardEngineObserver>();
-            foreach (var o in all)
-                if (o is not CompositeShardEngineObserver)
-                    list.Add(o);
-            return new CompositeShardEngineObserver(list);
-        });
         return services;
     }
 
