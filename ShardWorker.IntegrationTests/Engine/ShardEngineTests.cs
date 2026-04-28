@@ -533,5 +533,41 @@ public sealed partial class ShardEngineTests
 
         Assert.Contains(observer.Events, e => e.Event == "Stolen");
     }
+
+    [Fact]
+    public async Task Engine_TwoInstances_MaxShardsPerInstance_CoversHighIndexedShards()
+    {
+        var sharedProvider = new InMemoryShardLockProvider();
+        var workerA = new CountingWorker();
+        var workerB = new CountingWorker();
+
+        void Configure(ShardWorkerOptions opts)
+        {
+            opts.TotalShards = 10;
+            opts.MaxShardsPerInstance = 3;
+            opts.ReleaseOnCompletion = true;  // shards cycle back so all indices rotate through
+            opts.AcquireInterval = TimeSpan.FromMilliseconds(50);
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(0);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(500);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
+        }
+
+        using var hostA = BuildHost(workerA, sharedProvider, Configure);
+        using var hostB = BuildHost(workerB, sharedProvider, Configure);
+
+        await Task.WhenAll(hostA.StartAsync(), hostB.StartAsync());
+        await WaitForAsync(() =>
+        {
+            var all = workerA.SeenShards.Concat(workerB.SeenShards).ToHashSet();
+            return all.Contains(1) && all.Contains(8);
+        }, timeoutMs: 10_000);
+
+        await Task.WhenAll(hostA.StopAsync(), hostB.StopAsync());
+
+        var allSeen = workerA.SeenShards.Concat(workerB.SeenShards).ToHashSet();
+        Assert.Contains(1, allSeen);
+        Assert.Contains(8, allSeen);
+    }
 }
 

@@ -29,6 +29,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
     private readonly IShardEngineObserver? _observer;
     private readonly string _workerName = typeof(TWorker).Name;
     private readonly string _instanceId = Guid.NewGuid().ToString("N")[..12];
+    private readonly Random _rng = new Random();
 
     // shardIndex → (worker CTS, worker Task)
     private readonly ConcurrentDictionary<int, (CancellationTokenSource Cts, Task Task)> _held = new();
@@ -84,10 +85,16 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             {
                 if (!_held.ContainsKey(i))
                     candidates.Add(i);
-
-                if (candidates.Count == capacity)
-                    break;
             }
+
+            for (int i = candidates.Count - 1; i > 0; i--)
+            {
+                int j = _rng.Next(i + 1);
+                (candidates[i], candidates[j]) = (candidates[j], candidates[i]);
+            }
+
+            if (candidates.Count > capacity)
+                candidates.RemoveRange(capacity, candidates.Count - capacity);
 
             if (candidates.Count > 0)
             {
