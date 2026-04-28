@@ -61,6 +61,13 @@ Each `AddShardEngine<TWorker>` registration is fully independent: its own `Backg
 
 ## Processing modes
 
+| Mode | `ReleaseOnCompletion` | `ReleaseOnThrows` | Shard ownership | Best for |
+|---|---|---|---|---|
+| **Persistent partition** | `false` | `false` | Held until shutdown or crash | Continuous polling, scheduled scans |
+| **Task-queue** | `true` | `false` | Released after each clean return | Discrete jobs, work queues |
+| **Error retry** | `false` | `true` | Released after any exception | Fail-and-redistribute patterns |
+| **Parallel execution** | either | either | Same as above, N slots per shard | I/O-bound workers with parallelisable work |
+
 ### Persistent partition (default)
 
 Each instance holds its shards indefinitely. `ExecuteAsync` is called in a tight loop on the same shard:
@@ -97,6 +104,18 @@ services.AddShardEngine<CustomerSyncWorker>(
     },
     new PostgresShardLockProvider(connectionString, "customer_sync_locks"));
 ```
+
+How `TotalShards` and `MaxShardsPerInstance` interact (example: `TotalShards = 30`):
+
+| Instances | `MaxShardsPerInstance` | Shards per instance | Unclaimed |
+|---|---|---|---|
+| 1 | ∞ (default) | 30 | 0 |
+| 3 | ∞ (default) | ~10 each (first-come) | 0 |
+| 3 | `10` | 10 each (enforced) | 0 |
+| 2 | `10` | 10 each | 10 — available for a third instance |
+| 1 → scales to 3 | `10` | Instance 1 keeps its 30 until restart | New instances claim the gap only if 1 restarts |
+
+> `MaxShardsPerInstance` prevents acquiring more, but does not force an instance to give up shards it already holds. Rebalancing happens naturally on restart or lock expiry.
 
 ### Task-queue mode (`ReleaseOnCompletion = true`)
 
@@ -153,10 +172,12 @@ services.AddShardEngine<OrderWorker>(
 
 With 30 shards, 2 instances, and `MaxShardsPerInstance = 10`:
 
-1. Instance A claims shards 0–9, Instance B claims shards 10–19. Shards 20–29 are unclaimed.
-2. Instance A finishes shard 3 → shard 3 released immediately.
-3. Instance A is now at 9 held → next acquire cycle picks up shard 20.
-4. Over time all 30 shards are processed continuously across both instances.
+| Step | Instance A | Instance B | Unclaimed |
+|---|---|---|---|
+| Startup | Claims 0–9 (10 held) | Claims 10–19 (10 held) | 20–29 |
+| A finishes shard 3 | Releases 3 → holds 9 | Holds 10–19 | 3, 20–29 |
+| Next acquire cycle | Claims shard 20 → back to 10 | Holds 10–19 | 3, 21–29 |
+| Steady state | 10 held, cycling through pool | 10 held, cycling through pool | Always some unclaimed |
 
 > If `ExecuteAsync` **throws**, the shard is **not** released — it stays held and retries on the next loop iteration. Only a clean return triggers the release.
 
