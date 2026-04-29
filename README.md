@@ -11,19 +11,18 @@ A lightweight .NET library for running distributed, sharded background workers c
 The total workload is divided into **N shards** (numbered `0` to `N-1`). Every running instance continuously tries to acquire shard locks via the configured `IShardLockProvider`. Once a shard is acquired, a worker loop is started for it. A heartbeat loop renews held locks in the background. If a lock renewal fails (e.g. the instance was too slow), the worker for that shard is stopped and the shard becomes available for another instance to claim.
 
 ```
-Instance A                  Instance B
-│                           │
-│  (shuffle candidates)     │  (shuffle candidates)
-├─ Acquire shard 3 ✓        ├─ Acquire shard 3 ✗ (held by A)
-├─ Acquire shard 7 ✓        ├─ Acquire shard 7 ✗ (held by A)
-├─ Acquire shard 1 ✓        ├─ Acquire shard 0 ✓
-│                           ├─ Acquire shard 5 ✓
-│                           │  ...
-│                           │
-├─ Heartbeat (renew 3,7,1)  ├─ Heartbeat (renew 0,5)
-│                           │
-└─ Graceful stop:           └─ Graceful stop:
-   release 3, 7, 1             release 0, 5
+Instance A (cursor offset 3) Instance B (cursor offset 17)
+│                            │
+│  walk from offset 3 →      │  walk from offset 17 →
+├─ Acquire shard 3 ✓         ├─ Acquire shard 17 ✓
+├─ Acquire shard 4 ✓         ├─ Acquire shard 18 ✓
+├─ Acquire shard 5 ✓         ├─ Acquire shard 19 ✓
+│                            │  ...
+│                            │
+├─ Heartbeat (renew 3,4,5)   ├─ Heartbeat (renew 17,18,19)
+│                            │
+└─ Graceful stop:            └─ Graceful stop:
+   release 3, 4, 5              release 17, 18, 19
 ```
 
 Lock rows in the database are the single source of truth. If an instance dies, its lock rows expire naturally after `LockExpiry` and other instances pick up those shards on the next acquire cycle.
@@ -60,7 +59,7 @@ Each `AddShardEngine<TWorker>` registration is fully independent: its own `Backg
 - **Lower `AcquireInterval`** → faster rebalancing after an instance dies or joins. The cost is still one DB round-trip per interval.
 - **Lower `HeartbeatInterval`** → locks renew more frequently, reducing the window where a slow instance's shards expire and get stolen. Must stay below `LockExpiry`.
 - **`LockExpiry`** is the maximum time a shard is unavailable after its owning instance crashes. Set it to the longest acceptable gap in processing.
-- **`MaxShardsPerInstance`** caps how many shards one instance holds. Use it when you want to guarantee headroom for other instances (e.g. `TotalShards=30`, `MaxShardsPerInstance=10` → at least 3 instances needed to cover all shards). Candidates are shuffled on every acquire cycle so instances spread across the full index range rather than always racing for the lowest-numbered shards.
+- **`MaxShardsPerInstance`** caps how many shards one instance holds. Use it when you want to guarantee headroom for other instances (e.g. `TotalShards=30`, `MaxShardsPerInstance=10` → at least 3 instances needed to cover all shards). Each instance walks shards in a round-robin order starting from a random cursor offset chosen at startup, so instances naturally spread across different parts of the index range rather than all competing for the same shards each cycle. Every shard gets equal opportunity — a fast-completing shard won't be re-acquired ahead of shards that haven't been visited yet.
 - **`ReleaseOnCompletion`** turns the library into a task-queue style dispatcher — see below.
 - **`ReleaseOnThrows`** releases a shard after an unhandled exception, letting another instance retry rather than the same instance looping.
 - **`WorkerConcurrency`** runs N parallel execution slots per shard. Useful for I/O-bound workers where a single shard produces enough parallelisable work for multiple concurrent calls — see below.
@@ -218,7 +217,7 @@ With 30 shards, 2 instances, and `MaxShardsPerInstance = 10`:
 | A finishes shard 3 | Releases 3 → holds 9 | Holds its 10 | 3 + remaining |
 | Next acquire cycle | Claims one unclaimed shard → back to 10 | Holds its 10 | One fewer unclaimed |
 
-> Instances shuffle their candidate list on every acquire cycle, so the specific shard indices claimed at startup are non-deterministic. The table uses placeholder sets to illustrate the cycling pattern.
+> Instances walk their candidate list in round-robin order starting from a random offset, so the specific shard indices claimed at startup are non-deterministic. The table uses placeholder sets to illustrate the cycling pattern.
 | Steady state | 10 held, cycling through pool | 10 held, cycling through pool | Always some unclaimed |
 
 > If `ExecuteAsync` **throws**, the shard is **not** released — it stays held and retries on the next loop iteration. Only a clean return triggers the release.

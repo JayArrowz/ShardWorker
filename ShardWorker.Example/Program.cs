@@ -31,8 +31,7 @@ builder.Services
         opts.MaxShardsPerInstance = 30;
         opts.LockExpiry = TimeSpan.FromMinutes(2);
         opts.HeartbeatInterval = TimeSpan.FromSeconds(30);
-        opts.AcquireInterval = TimeSpan.FromSeconds(15);
-        opts.WorkerInterval = TimeSpan.FromSeconds(30);
+        opts.AcquireInterval = TimeSpan.FromSeconds(1); // task-queue mode: re-acquire as soon as a slot frees
         opts.ShutdownTimeout = TimeSpan.FromSeconds(30);
         opts.ReleaseOnCompletion = true;
         opts.ReleaseOnThrows = true;

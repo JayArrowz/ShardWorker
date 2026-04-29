@@ -30,6 +30,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
     private readonly string _workerName = typeof(TWorker).Name;
     private readonly string _instanceId = Guid.NewGuid().ToString("N")[..12];
     private readonly Random _rng = new();
+    private int _acquireCursor;
 
     // shardIndex → (worker CTS, worker Task)
     private readonly ConcurrentDictionary<int, (CancellationTokenSource Cts, Task Task)> _held = new();
@@ -62,6 +63,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
     {
         await _provider.EnsureSchemaAsync(stoppingToken);
         _logger.LogInformation("[{Worker}:{Id}] Started. TotalShards={N}", _workerName, _instanceId, _opts.TotalShards);
+        lock (_rng) { _acquireCursor = _rng.Next(_opts.TotalShards); }
 
         await Task.WhenAll(
             AcquireLoopAsync(stoppingToken),
@@ -80,22 +82,18 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                 continue;
             }
 
-            var candidates = new List<int>(_opts.TotalShards);
-            for (int i = 0; i < _opts.TotalShards; i++)
+            // Walk from _acquireCursor, wrapping around, to give every shard equal
+            // opportunity. The random starting offset (set at startup) prevents instances
+            // from converging on the same shards each cycle.
+            var candidates = new List<int>(capacity);
+            var total = _opts.TotalShards;
+            for (int i = 0; i < total && candidates.Count < capacity; i++)
             {
-                if (!_held.ContainsKey(i))
-                    candidates.Add(i);
+                var shardIndex = (_acquireCursor + i) % total;
+                if (!_held.ContainsKey(shardIndex))
+                    candidates.Add(shardIndex);
             }
-
-            for (int i = candidates.Count - 1; i > 0; i--)
-            {
-                int j;
-                lock (_rng) { j = _rng.Next(i + 1); }
-                (candidates[i], candidates[j]) = (candidates[j], candidates[i]);
-            }
-
-            if (candidates.Count > capacity)
-                candidates.RemoveRange(capacity, candidates.Count - capacity);
+            _acquireCursor = (_acquireCursor + Math.Max(1, candidates.Count)) % total;
 
             if (candidates.Count > 0)
             {
