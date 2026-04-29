@@ -706,7 +706,30 @@ After this, the four ShardWorker counters (`shardworker.shards.acquired`, `shard
 - **Stats row** — total shards, held count, free count, distinct instance count
 - **Shard grid** — one cell per shard, colour-coded by owning instance; free shards shown in grey; shards expiring within 30 s highlighted with an amber outline
 - **Instance list** — each instance ID with its held shard indices
-- **Auto-refresh** — page reloads every 5 seconds
+- **Auto-refresh** — page reloads every 2 seconds by default (configurable)
+
+### Dashboard and short-lived shards
+
+The dashboard is a **point-in-time snapshot** — it shows which shards are held at the moment the page renders. With `ReleaseOnCompletion = true` and fast-completing work, a shard can be acquired, processed, and released within milliseconds — entirely between two refreshes. In that case the dashboard shows 0 held shards even though the engine is actively cycling through work.
+
+This is expected behaviour, not a bug. The engine is working correctly; the dashboard just cannot observe locks that come and go faster than its refresh interval.
+
+Example scenario where this manifests:
+
+```csharp
+opts.TotalShards          = 1000;
+opts.MaxShardsPerInstance = 30;
+opts.AcquireInterval      = TimeSpan.FromSeconds(1);
+opts.ReleaseOnCompletion  = true;
+```
+
+With only 200 items of work spread across 1 000 shards, 800 shards have nothing to process and release immediately. The 200 active shards may also complete before the next refresh. The dashboard will frequently show all shards free while the logs confirm steady acquire/release activity.
+
+To make activity more visible in this case:
+
+- **Reduce `refreshIntervalMs`** down toward `AcquireInterval` (e.g. 500 ms): `app.MapShardWorkerDashboard(refreshIntervalMs: 500)`. This increases the chance of catching an in-flight lock but can never guarantee it for sub-100 ms work.
+- **Use `shard.RequestRelease()` instead of `ReleaseOnCompletion = true`** — the worker holds the shard and only releases when there is genuinely nothing to do, so active shards stay visible for the duration of their work.
+- **Rely on logs and metrics** (`shardworker.shards.acquired` / `shardworker.shards.released` counters) for throughput visibility rather than the dashboard grid when work is very fast.
 
 ### Setup
 
