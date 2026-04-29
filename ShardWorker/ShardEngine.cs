@@ -82,11 +82,12 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                 continue;
             }
 
+            var total = _opts.TotalShards;
+
             // Walk from _acquireCursor, wrapping around, to give every shard equal
             // opportunity. The random starting offset (set at startup) prevents instances
             // from converging on the same shards each cycle.
-            var candidates = new List<int>(capacity);
-            var total = _opts.TotalShards;
+            var candidates = new List<int>(Math.Min(capacity, total));
             for (int i = 0; i < total && candidates.Count < capacity; i++)
             {
                 var shardIndex = (_acquireCursor + i) % total;
