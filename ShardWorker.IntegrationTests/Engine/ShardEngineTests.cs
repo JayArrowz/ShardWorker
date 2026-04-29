@@ -570,5 +570,160 @@ public sealed partial class ShardEngineTests
         Assert.Contains(1, allSeen);
         Assert.Contains(8, allSeen);
     }
+
+    [Fact]
+    public async Task RequestRelease_ReleasesLockAfterCleanReturn()
+    {
+        // Worker calls shard.RequestRelease() — the shard must be released so a competitor can claim it.
+        var executed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new LambdaWorker((ctx, ct) =>
+        {
+            ctx.RequestRelease();
+            executed.TrySetResult();
+            return Task.CompletedTask;
+        });
+
+        var provider = new InMemoryShardLockProvider();
+        using var host = BuildHost(worker, provider, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.AcquireInterval = TimeSpan.FromSeconds(5); // long gap — prevents re-acquire during probe
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(0);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
+        });
+
+        await host.StartAsync();
+        await executed.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        // Give the async finally block time to call ReleaseManyAsync
+        await Task.Delay(300);
+
+        // A competitor must now be able to acquire shard 0
+        var acquired = await provider.TryAcquireManyAsync([0], "competitor", TimeSpan.FromSeconds(30));
+        Assert.Contains(0, acquired);
+
+        await host.StopAsync();
+    }
+
+    [Fact]
+    public async Task RequestRelease_NotCalled_KeepsLock()
+    {
+        // Worker does NOT call RequestRelease() — shard must stay held and be unavailable to a competitor.
+        var executed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new LambdaWorker((ctx, ct) =>
+        {
+            // deliberately does not call ctx.RequestRelease()
+            executed.TrySetResult();
+            return Task.CompletedTask;
+        });
+
+        var provider = new InMemoryShardLockProvider();
+        using var host = BuildHost(worker, provider, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(500);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
+        });
+
+        await host.StartAsync();
+        await executed.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        // Give time for any erroneous release to happen
+        await Task.Delay(300);
+
+        // Shard must still be held — competitor must not be able to claim it
+        var acquired = await provider.TryAcquireManyAsync([0], "competitor", TimeSpan.FromSeconds(30));
+        Assert.Empty(acquired);
+
+        await host.StopAsync();
+    }
+
+    [Fact]
+    public async Task RequestRelease_OnThrow_DoesNotRelease()
+    {
+        // Worker calls RequestRelease() but then throws.
+        // Because ExecuteAsync did not complete cleanly, the flag must be ignored — shard stays held.
+        var executed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var worker = new LambdaWorker((ctx, ct) =>
+        {
+            ctx.RequestRelease(); // flag set ...
+            executed.TrySetResult();
+            throw new InvalidOperationException("deliberate"); // ... but worker throws
+        });
+
+        var provider = new InMemoryShardLockProvider();
+        using var host = BuildHost(worker, provider, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.ReleaseOnThrows = false; // ensures throw path does not release independently
+            opts.AcquireInterval = TimeSpan.FromSeconds(5);
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(500);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
+        });
+
+        await host.StartAsync();
+        await executed.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        // Give time for any erroneous release to happen
+        await Task.Delay(300);
+
+        // RequestRelease() must be ignored when ExecuteAsync throws — shard stays held
+        var acquired = await provider.TryAcquireManyAsync([0], "competitor", TimeSpan.FromSeconds(30));
+        Assert.Empty(acquired);
+
+        await host.StopAsync();
+    }
+
+    [Fact]
+    public async Task RequestRelease_WithConcurrency_ReleasesLockWhenSlotRequests()
+    {
+        // With WorkerConcurrency = 2, when any slot calls RequestRelease() all slots must
+        // exit and the shard lock must be released.
+        var releaseRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var slotStartCount = 0;
+        var bothStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var worker = new LambdaWorker(async (ctx, ct) =>
+        {
+            if (Interlocked.Increment(ref slotStartCount) == 2)
+                bothStarted.TrySetResult();
+
+            await bothStarted.Task.WaitAsync(ct); // ensure both slots are running before proceeding
+
+            ctx.RequestRelease();
+            releaseRequested.TrySetResult();
+        });
+
+        var provider = new InMemoryShardLockProvider();
+        using var host = BuildHost(worker, provider, opts =>
+        {
+            opts.TotalShards = 1;
+            opts.WorkerConcurrency = 2;
+            opts.AcquireInterval = TimeSpan.FromSeconds(5); // long gap — prevents re-acquire during probe
+            opts.WorkerInterval = TimeSpan.FromMilliseconds(0);
+            opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
+            opts.LockExpiry = TimeSpan.FromSeconds(30);
+            opts.ShutdownTimeout = TimeSpan.FromSeconds(5);
+        });
+
+        await host.StartAsync();
+        await releaseRequested.Task.WaitAsync(TimeSpan.FromSeconds(8));
+
+        // Give the async finally block time to call ReleaseManyAsync
+        await Task.Delay(300);
+
+        // All slots must have exited and the shard lock released
+        var acquired = await provider.TryAcquireManyAsync([0], "competitor", TimeSpan.FromSeconds(30));
+        Assert.Contains(0, acquired);
+
+        await host.StopAsync();
+    }
 }
 

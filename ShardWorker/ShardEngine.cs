@@ -221,7 +221,7 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                 TryNotify(o => o.OnWorkerFaulted(_workerName, _instanceId, shardIndex, ex));
             }
 
-            if (completed && _opts.ReleaseOnCompletion)
+            if (completed && (_opts.ReleaseOnCompletion || context.IsReleaseRequested))
             {
                 _logger.LogDebug("[{Worker}:{Id}] Shard {Shard} completed — releasing for requeue",
                     _workerName, _instanceId, shardIndex);

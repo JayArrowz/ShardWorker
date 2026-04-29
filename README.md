@@ -72,6 +72,7 @@ Each `AddShardEngine<TWorker>` registration is fully independent: its own `Backg
 | Mode | `ReleaseOnCompletion` | `ReleaseOnThrows` | Shard ownership | Best for |
 |---|---|---|---|---|
 | **Persistent partition** | `false` | `false` | Held until shutdown or crash | Continuous polling, scheduled scans |
+| **Sparse work** | `false` | `false` | Held when busy, released when idle via `shard.RequestRelease()` | Workloads with uneven or intermittent shard distribution |
 | **Task-queue** | `true` | `false` | Released after each clean return | Discrete jobs, work queues |
 | **Error retry** | `false` | `true` | Released after any exception | Fail-and-redistribute patterns |
 | **Parallel execution** | either | either | Same as above, N slots per shard | I/O-bound workers with parallelisable work |
@@ -124,6 +125,36 @@ How `TotalShards` and `MaxShardsPerInstance` interact (example: `TotalShards = 3
 | 1 → scales to 3 | `10` | Instance 1 keeps its 30 until restart | New instances claim the gap only if 1 restarts |
 
 > `MaxShardsPerInstance` prevents acquiring more, but does not force an instance to give up shards it already holds. Rebalancing happens naturally on restart or lock expiry.
+
+### Sparse work mode (`shard.RequestRelease()`)
+
+In persistent partition mode shards are held forever, even when they have nothing to do. If your work is unevenly distributed — e.g. only 2 of 10 shards have pending users at any given time — idle shards tie up capacity that could be used by active ones.
+
+`shard.RequestRelease()` lets the worker signal on a per-execution basis: release this shard now if there is nothing to process, but keep holding it when there is. This is safer than `ReleaseOnCompletion = true`, which releases after *every* clean return regardless of whether work was done.
+
+```csharp
+public class UserSyncWorker : IShardedWorker
+{
+    public async Task ExecuteAsync(ShardContext shard, CancellationToken ct)
+    {
+        var users = await _db.GetPendingUsersForShardAsync(shard.Index, shard.Total, ct);
+
+        if (users.Count == 0)
+        {
+            shard.RequestRelease(); // nothing here — free the shard for other instances
+            return;
+        }
+
+        foreach (var user in users)
+            await _processor.ProcessAsync(user, ct);
+        // returning without RequestRelease() keeps the shard held
+    }
+}
+```
+
+When `RequestRelease()` is called, the shard is released at the end of that execution and goes back into the unclaimed pool. On the next `AcquireInterval` tick, any instance (including this one, if it has capacity) can claim it again. If new work has since arrived in that shard's bucket, it will be picked up within one acquire cycle.
+
+> **`RequestRelease()` is evaluated only on a clean return.** If `ExecuteAsync` throws, the flag is ignored — the throw path is controlled by `ReleaseOnThrows`. Calling `RequestRelease()` when `ReleaseOnCompletion = true` has no additional effect; the shard would have been released anyway.
 
 ### Task-queue mode (`ReleaseOnCompletion = true`)
 
@@ -228,8 +259,8 @@ services.AddShardEngine<OrderWorker>(
 
 With 10 shards and `WorkerConcurrency = 4`, a single instance runs up to **40 concurrent `ExecuteAsync` calls**. This is useful when each shard maps to a queue or partition that can be drained in parallel.
 
-`ReleaseOnCompletion` and `ReleaseOnThrows` interact with concurrency as follows:
-- When any slot calls `cts.Cancel()` (via `ReleaseOnCompletion` or `ReleaseOnThrows`), all other slots for that shard observe the cancellation and exit cleanly.
+`ReleaseOnCompletion`, `ReleaseOnThrows`, and `shard.RequestRelease()` interact with concurrency as follows:
+- When any slot triggers a release (via `ReleaseOnCompletion`, `ReleaseOnThrows`, or `RequestRelease()`), the shared CTS is cancelled and all other slots for that shard observe the cancellation and exit cleanly.
 - The shard is released once **all** slots have exited (the `finally` block in `StartWorker` fires after `Task.WhenAll`).
 
 ---
