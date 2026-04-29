@@ -1,9 +1,10 @@
 ﻿using Npgsql;
 using ShardWorker.Core.Interface;
+using ShardWorker.Core.Model;
 
 namespace ShardWorker.Providers.Postgres;
 
-public sealed class PostgresShardLockProvider : IShardLockProvider
+public sealed class PostgresShardLockProvider : IShardLockProvider, IShardLockQueryProvider
 {
     private readonly string _connectionString;
     private readonly string _table;
@@ -114,6 +115,20 @@ public sealed class PostgresShardLockProvider : IShardLockProvider
         cmd.Parameters.Add(new NpgsqlParameter { ParameterName = "@shards", Value = ToIntArray(shards) });
         cmd.Parameters.AddWithValue("@instance_id", instanceId);
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<ShardLockRow>> GetAllLocksAsync(CancellationToken ct = default)
+    {
+        await using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT shard_index, instance_id, expires_at FROM {_table} WHERE expires_at > NOW() ORDER BY shard_index;";
+        var result = new List<ShardLockRow>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            result.Add(new ShardLockRow(reader.GetInt32(0), reader.GetString(1), reader.GetFieldValue<DateTimeOffset>(2)));
+        return result;
     }
 
     private static int[] ToIntArray(IReadOnlyList<int> list)

@@ -23,10 +23,19 @@ public static class ShardEngineServiceCollectionExtensions
         Func<IServiceProvider, IShardLockProvider> lockProviderFactory)
         where TWorker : class, IShardedWorker
     {
+        var opts = new ShardWorkerOptions();
+        configure(opts);
+
         services.Configure<ShardWorkerOptions>(typeof(TWorker).Name, configure);
         services.TryAddSingleton<TWorker>();
         services.AddSingleton<IShardLockProvider<TWorker>>(sp =>
             new TypedShardLockProvider<TWorker>(lockProviderFactory(sp)));
+        services.AddSingleton<WorkerRegistration>(sp => new WorkerRegistration
+        {
+            WorkerName = typeof(TWorker).Name,
+            TotalShards = opts.TotalShards,
+            LockProvider = lockProviderFactory(sp)
+        });
         services.AddHostedService<ShardEngine<TWorker>>();
         return services;
     }
@@ -40,7 +49,21 @@ public static class ShardEngineServiceCollectionExtensions
         IShardLockProvider lockProvider)
         where TWorker : class, IShardedWorker
     {
-        return services.AddShardEngine<TWorker>(configure, _ => lockProvider);
+        var opts = new ShardWorkerOptions();
+        configure(opts);
+
+        services.Configure<ShardWorkerOptions>(typeof(TWorker).Name, configure);
+        services.TryAddSingleton<TWorker>();
+        services.AddSingleton<IShardLockProvider<TWorker>>(
+            new TypedShardLockProvider<TWorker>(lockProvider));
+        services.AddSingleton(new WorkerRegistration
+        {
+            WorkerName = typeof(TWorker).Name,
+            TotalShards = opts.TotalShards,
+            LockProvider = lockProvider
+        });
+        services.AddHostedService<ShardEngine<TWorker>>();
+        return services;
     }
 }
 

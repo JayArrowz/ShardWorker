@@ -1,10 +1,11 @@
 ﻿using MySqlConnector;
 using ShardWorker.Core.Interface;
+using ShardWorker.Core.Model;
 using System.Text;
 
 namespace ShardWorker.Providers.MySql;
 
-public sealed class MySqlShardLockProvider : IShardLockProvider
+public sealed class MySqlShardLockProvider : IShardLockProvider, IShardLockQueryProvider
 {
     private readonly string _connectionString;
     private readonly string _table;
@@ -123,6 +124,20 @@ public sealed class MySqlShardLockProvider : IShardLockProvider
         await using var reader = await cmd.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             result.Add(reader.GetInt32(0));
+        return result;
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<ShardLockRow>> GetAllLocksAsync(CancellationToken ct = default)
+    {
+        await using var conn = new MySqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT shard_index, instance_id, expires_at FROM `{_table}` WHERE expires_at > UTC_TIMESTAMP(6) ORDER BY shard_index;";
+        var result = new List<ShardLockRow>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            result.Add(new ShardLockRow(reader.GetInt32(0), reader.GetString(1), new DateTimeOffset(reader.GetDateTime(2), TimeSpan.Zero)));
         return result;
     }
 

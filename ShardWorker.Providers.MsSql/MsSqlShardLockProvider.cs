@@ -1,10 +1,11 @@
 ﻿using Microsoft.Data.SqlClient;
 using ShardWorker.Core.Interface;
+using ShardWorker.Core.Model;
 using System.Text;
 
 namespace ShardWorker.Providers.MsSql;
 
-public sealed class MsSqlShardLockProvider : IShardLockProvider
+public sealed class MsSqlShardLockProvider : IShardLockProvider, IShardLockQueryProvider
 {
     private readonly string _connectionString;
     private readonly string _table;
@@ -120,6 +121,20 @@ public sealed class MsSqlShardLockProvider : IShardLockProvider
             """;
         cmd.Parameters.AddWithValue("@iid", instanceId);
         await cmd.ExecuteNonQueryAsync(ct);
+    }
+
+    /// <inheritdoc/>
+    public async Task<IReadOnlyList<ShardLockRow>> GetAllLocksAsync(CancellationToken ct = default)
+    {
+        await using var conn = new SqlConnection(_connectionString);
+        await conn.OpenAsync(ct);
+        await using var cmd = conn.CreateCommand();
+        cmd.CommandText = $"SELECT shard_index, instance_id, expires_at FROM [{_table}] WHERE expires_at > SYSDATETIMEOFFSET() ORDER BY shard_index;";
+        var result = new List<ShardLockRow>();
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+        while (await reader.ReadAsync(ct))
+            result.Add(new ShardLockRow(reader.GetInt32(0), reader.GetString(1), reader.GetDateTimeOffset(2)));
+        return result;
     }
 
     private static string BuildInClause(IReadOnlyList<int> values, SqlCommand cmd)

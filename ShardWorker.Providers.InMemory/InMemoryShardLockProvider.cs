@@ -1,12 +1,14 @@
 ﻿using ShardWorker.Core.Interface;
+using ShardWorker.Core.Model;
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
 namespace ShardWorker.Providers.InMemory;
 
-public sealed class InMemoryShardLockProvider : IShardLockProvider
+public sealed class InMemoryShardLockProvider : IShardLockProvider, IShardLockQueryProvider
 {
     private readonly Dictionary<int, LockRow> _rows = new();
     private readonly object _lock = new();
@@ -74,5 +76,19 @@ public sealed class InMemoryShardLockProvider : IShardLockProvider
             }
         }
         return Task.CompletedTask;
+    }
+
+    /// <inheritdoc/>
+    public Task<IReadOnlyList<ShardLockRow>> GetAllLocksAsync(CancellationToken ct = default)
+    {
+        var now = DateTimeOffset.UtcNow;
+        lock (_lock)
+        {
+            var rows = _rows
+                .Where(kvp => kvp.Value.ExpiresAt > now)
+                .Select(kvp => new ShardLockRow(kvp.Key, kvp.Value.InstanceId, kvp.Value.ExpiresAt))
+                .ToList();
+            return Task.FromResult<IReadOnlyList<ShardLockRow>>(rows);
+        }
     }
 }

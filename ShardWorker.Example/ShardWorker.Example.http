@@ -1,0 +1,6 @@
+@ShardWorker.Example_HostAddress = http://localhost:5211
+
+GET {{ShardWorker.Example_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk.Razor">
+
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net9.0;net10.0</TargetFrameworks>
+    <LangVersion>12</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Description>Optional Blazor dashboard for ShardWorker — provides a /shard-dashboard route showing live shard ownership across all instances.</Description>
+    <Summary>Embedded Blazor SSR dashboard for ShardWorker showing live shard ownership, TTL health, and coverage across all running instances.</Summary>
+    <PackageTags>shard;worker;distributed;background-service;dashboard;blazor;aspnetcore</PackageTags>
+    <Authors>JayArrowz</Authors>
+    <Company>JayArrowz</Company>
+    <Product>ShardWorker.Dashboard</Product>
+    <Copyright>Copyright © JayArrowz 2026</Copyright>
+    <PackageProjectUrl>https://github.com/JayArrowz/ShardWorker</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/JayArrowz/ShardWorker</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <PackageReleaseNotes>See https://github.com/JayArrowz/ShardWorker/releases for release notes.</PackageReleaseNotes>
+    <GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <PublishRepositoryUrl>true</PublishRepositoryUrl>
+    <EmbedUntrackedSources>true</EmbedUntrackedSources>
+    <DebugType>portable</DebugType>
+    <NoWarn>$(NoWarn);CS1591;CS8632</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="../README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\ShardWorker.Core\ShardWorker.Core.csproj" />
+  </ItemGroup>
+
+  <!-- Development Dependencies -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.102" PrivateAssets="All" />
+    <PackageReference Include="MinVer" Version="7.0.0" PrivateAssets="All" />
+  </ItemGroup>
+
+</Project>
