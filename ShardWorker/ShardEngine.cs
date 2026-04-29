@@ -139,8 +139,8 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                         {
                             _logger.LogWarning("[{Worker}:{Id}] Shard {Shard} renewal failed — stopping worker",
                                 _workerName, _instanceId, shardIndex);
-                            TryNotify(o => o.OnShardStolen(_workerName, _instanceId, shardIndex));
-                            StopWorker(shardIndex);
+                            if (StopWorker(shardIndex))
+                                TryNotify(o => o.OnShardStolen(_workerName, _instanceId, shardIndex));
                         }
                     }
                 }
@@ -171,9 +171,10 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             }
             finally
             {
-                var wasOwned = _held.TryRemove(shardIndex, out _);
+                var wasOwned = _held.TryRemove(shardIndex, out var removedEntry);
                 if (wasOwned)
                 {
+                    removedEntry.Cts.Dispose();
                     try
                     {
                         using var releaseCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
@@ -251,13 +252,15 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         }
     }
 
-    private void StopWorker(int shardIndex)
+    private bool StopWorker(int shardIndex)
     {
         if (_held.TryRemove(shardIndex, out var entry))
         {
             entry.Cts.Cancel();
             entry.Cts.Dispose();
+            return true;
         }
+        return false;
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
