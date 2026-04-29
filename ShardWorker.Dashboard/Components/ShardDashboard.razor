@@ -18,7 +18,7 @@
         .sw-header-meta { text-align: right; font-size: 0.75rem; color: #94a3b8; line-height: 1.6; }
 
         /* ── Refresh bar ── */
-        .sw-refresh-bar { height: 3px; background: #3b82f6; animation: sw-shrink 5s linear forwards; }
+        .sw-refresh-bar { height: 3px; background: #3b82f6; animation: sw-shrink @(RefreshIntervalMs)ms linear forwards; }
         @@keyframes sw-shrink { from { width: 100%; } to { width: 0%; } }
 
         /* ── Layout ── */
@@ -103,7 +103,7 @@
     </div>
     <div class="sw-header-meta">
         <div>@_snapshot.Timestamp.ToString("yyyy-MM-dd HH:mm:ss") UTC</div>
-        <div>Auto-refreshing every 5 s</div>
+        <div>Auto-refreshing every @(RefreshIntervalMs / 1000.0)s</div>
     </div>
 </header>
 
@@ -308,12 +308,14 @@
 }
 </main>
 
-<script>setTimeout(() => location.reload(), 5000);</script>
+<script>setTimeout(() => location.reload(), @RefreshIntervalMs);</script>
 
 </body>
 </html>
 
 @code {
+    [Parameter] public int RefreshIntervalMs { get; set; } = 2000;
+
     private DashboardSnapshot _snapshot = DashboardSnapshot.Empty;
 
     protected override async Task OnInitializedAsync()

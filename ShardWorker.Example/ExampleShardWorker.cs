@@ -26,8 +26,15 @@ public class ExampleShardWorker : IShardedWorker
             return;
         }
 
-        //Simulate 1s of work, then update the ProcessedCount for all items in this shard
-        await Task.Delay(TimeSpan.FromSeconds(1), ct);
-        await toProcess.ExecuteUpdateAsync(b => b.SetProperty(i => i.ProcessedCount, i => i.ProcessedCount + 1));
+        var toProcessItems = await toProcess.ToArrayAsync();
+        foreach (var item in toProcessItems)
+        {
+            //Simulate 300ms of work, then update the ProcessedCount for all items in this shard
+            await Task.Delay(TimeSpan.FromMilliseconds(300), ct);
+            item.ProcessedCount++;
+            exampleDbContext.Update(item);
+        }
+
+        await exampleDbContext.SaveChangesAsync();
     }
 }
