@@ -695,6 +695,9 @@ After this, the four ShardWorker counters (`shardworker.shards.acquired`, `shard
 
 ## Dashboard
 
+<img width="1910" height="879" alt="image" src="https://github.com/user-attachments/assets/1815e384-bb46-4ed4-96d2-adbb5a5405ad" />
+
+
 `ShardWorker.Dashboard` adds an embedded Blazor page to any ASP.NET Core host that shows live shard ownership across every running instance. It queries the lock provider directly — no side-channel, no extra infrastructure.
 
 ### What it shows
