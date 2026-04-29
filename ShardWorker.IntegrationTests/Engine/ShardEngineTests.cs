@@ -519,7 +519,7 @@ public sealed partial class ShardEngineTests
                 services.AddShardEngine<CountingWorker>(opts =>
                 {
                     opts.TotalShards = 1;
-                    opts.AcquireInterval = TimeSpan.FromMilliseconds(100);
+                    opts.AcquireInterval = TimeSpan.FromSeconds(60);
                     opts.WorkerInterval = TimeSpan.FromMilliseconds(50);
                     opts.HeartbeatInterval = TimeSpan.FromMilliseconds(200);
                     opts.LockExpiry = TimeSpan.FromSeconds(30);
