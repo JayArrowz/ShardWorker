@@ -195,9 +195,9 @@
       <h3>Simulation Speed</h3>
       <div class="speed-row">
         Slow
-        <input type="range" id="speedSlider" min="0.25" max="8" step="0.25" value="0.25" style="flex:1">
+        <input type="range" id="speedSlider" min="0.25" max="8" step="0.25" value="1" style="flex:1">
         Fast
-        <span id="speedVal">0.25×</span>
+        <span id="speedVal">1×</span>
       </div>
     </div>
 
@@ -242,6 +242,10 @@
       <div class="field">
         <label>Total Work Items <span id="lbl-workItems">100000</span></label>
         <input type="range" id="workItems" min="0" max="100000" step="100" value="100000">
+      </div>
+      <div class="field">
+        <label>Process Time / Item <span id="lbl-processTimeMs">50ms</span></label>
+        <input type="range" id="processTimeMs" min="0" max="2000" step="10" value="50">
       </div>
       <div class="field">
         <label>Fault Rate <span id="lbl-faultRate">0%</span></label>
@@ -314,13 +318,14 @@ let cfg = {
   lockExpiry: 20,
   workerInterval: 1,
   workItems: 100000,
+  processTimeMs: 50,
   faultRate: 0,
   releaseOnCompletion: true,
   releaseOnThrows: false,
 };
 
 let simTime = 0;           // simulated seconds elapsed
-let speed = 0.25;          // sim-seconds per real-second
+let speed = 1;             // sim-seconds per real-second
 let running = false;
 let rafId = null;
 let lastRealTs = null;
@@ -470,7 +475,9 @@ function tick(dt) {
           // collect ALL pending items for this shard (mirrors the real worker batch)
           const pendingIds = [...(pendingByShardIdx.get(si) || [])];
           const fault = rng() * 100 < cfg.faultRate;
-          const workDuration = 0.5 + rng() * cfg.workerInterval;
+          // work duration = max(workerInterval, items × processTimeMs)
+          const processSecs = cfg.processTimeMs > 0 ? (pendingIds.length * cfg.processTimeMs / 1000) : 0;
+          const workDuration = Math.max(cfg.workerInterval, processSecs) * (0.8 + rng() * 0.4);
 
           ss.working = true;
           ss.workingUntil = simTime + workDuration;
@@ -693,6 +700,7 @@ bindSlider('acquireInterval',  'acquireInterval',  v => v + 's');
 bindSlider('heartbeatInterval','heartbeatInterval',v => v + 's');
 bindSlider('lockExpiry',       'lockExpiry',       v => v + 's');
 bindSlider('workerInterval',   'workerInterval',   v => v + 's');
+bindSlider('processTimeMs',    'processTimeMs',    v => v === 0 ? 'instant' : v + 'ms');
 bindSlider('workItems',        'workItems',        v => v);
 bindSlider('faultRate',        'faultRate',        v => v + '%');
 
