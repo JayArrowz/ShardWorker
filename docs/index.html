@@ -329,6 +329,8 @@ let speed = 1;             // sim-seconds per real-second
 let running = false;
 let rafId = null;
 let lastRealTs = null;
+let lastRenderTs = 0;
+let logDirty = false;
 
 // instance state
 let instances = [];        // { id, color, shards: Map<shardIdx, shardState>, cursor, alive }
@@ -358,6 +360,8 @@ function reset() {
   logEntries = [];
   rebuildWorkItems();
   addInstance(); addInstance(); addInstance(); addInstance();
+  renderInstanceList();
+  logDirty = true;
   renderAll();
 }
 
@@ -406,6 +410,7 @@ function removeInstance(id) {
   inst.alive = false;
   instances = instances.filter(i => i.id !== id);
   log(`Instance ${id} removed`, 'instance');
+  renderInstanceList();
   renderAll();
 }
 
@@ -546,7 +551,6 @@ function renderAll() {
   renderStats();
   renderGrid();
   renderInstanceCards();
-  renderInstanceList();
   renderLog();
 }
 
@@ -621,23 +625,31 @@ function renderInstanceCards() {
       container.appendChild(card);
     }
 
-    // Update only the dynamic parts each frame
-    const held = [...inst.shards.keys()];
+    // Update only the dynamic parts — skip if nothing changed
+    const held = [...inst.shards.keys()].sort((a,b)=>a-b);
     const working = held.filter(si => { const ss = inst.shards.get(si); return ss && ss.working; });
 
-    card.querySelector('.badges').innerHTML =
-      (held.length ? `<span class="badge badge-green">${held.length} held</span>` : '') +
-      (working.length ? `<span class="badge badge-orange">${working.length} working</span>` : '') +
-      (inst.faults ? `<span class="badge badge-red">${inst.faults} fault${inst.faults>1?'s':''}</span>` : '') +
-      `<span class="badge badge-muted">${inst.workDone} done</span>`;
+    const badgesKey = `${held.length}:${working.length}:${inst.faults}:${inst.workDone}`;
+    if (card._badgesKey !== badgesKey) {
+      card._badgesKey = badgesKey;
+      card.querySelector('.badges').innerHTML =
+        (held.length ? `<span class="badge badge-green">${held.length} held</span>` : '') +
+        (working.length ? `<span class="badge badge-orange">${working.length} working</span>` : '') +
+        (inst.faults ? `<span class="badge badge-red">${inst.faults} fault${inst.faults>1?'s':''}</span>` : '') +
+        `<span class="badge badge-muted">${inst.workDone} done</span>`;
+    }
 
-    card.querySelector('.instance-shards').innerHTML =
-      held.length === 0 ? '<span style="color:var(--muted);font-size:0.75rem">No shards held</span>' :
-        held.sort((a,b)=>a-b).map(si => {
-          const ss = inst.shards.get(si);
-          const isWorking = ss && ss.working;
-          return `<div class="mini-shard${isWorking?' working':''}" style="background:${inst.color};${isWorking?'outline:2px solid #fff4;outline-offset:1px':''}">${si}</div>`;
-        }).join('');
+    const shardsKey = held.join(',') + '|' + working.join(',');
+    if (card._shardsKey !== shardsKey) {
+      card._shardsKey = shardsKey;
+      card.querySelector('.instance-shards').innerHTML =
+        held.length === 0 ? '<span style="color:var(--muted);font-size:0.75rem">No shards held</span>' :
+          held.map(si => {
+            const ss = inst.shards.get(si);
+            const isWorking = ss && ss.working;
+            return `<div class="mini-shard${isWorking?' working':''}" style="background:${inst.color};${isWorking?'outline:2px solid #fff4;outline-offset:1px':''}">${si}</div>`;
+          }).join('');
+    }
   }
 }
 
@@ -653,6 +665,8 @@ function renderInstanceList() {
 }
 
 function renderLog() {
+  if (!logDirty) return;
+  logDirty = false;
   const logEl = document.getElementById('eventLog');
   logEl.innerHTML = logEntries.slice(-80).reverse().map(e =>
     `<div class="log-entry ${e.type}">[${e.time.toFixed(1)}s] ${e.msg}</div>`
@@ -662,6 +676,7 @@ function renderLog() {
 function log(msg, type = 'info') {
   logEntries.push({ msg, type, time: simTime });
   if (logEntries.length > 300) logEntries.shift();
+  logDirty = true;
 }
 
 function loop(now) {
@@ -670,7 +685,11 @@ function loop(now) {
   lastRealTs = now;
   const dtSim = dtReal * speed;
   tick(dtSim);
-  renderAll();
+  // cap render at ~20fps to reduce GC pressure from DOM churn
+  if (now - lastRenderTs >= 50) {
+    lastRenderTs = now;
+    renderAll();
+  }
   rafId = requestAnimationFrame(loop);
 }
 
