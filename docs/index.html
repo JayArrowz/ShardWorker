@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ShardWorker – Interactive Demo</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --accent: #58a6ff;
+    --green: #3fb950;
+    --orange: #d29922;
+    --red: #f85149;
+    --muted: #8b949e;
+    --text: #e6edf3;
+    --radius: 8px;
+    --font: 'Segoe UI', system-ui, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: var(--bg); color: var(--text); font-family: var(--font); font-size: 14px; min-height: 100vh; }
+
+  header { padding: 28px 32px 0; max-width: 1400px; margin: 0 auto; }
+  header h1 { font-size: 2rem; font-weight: 700; letter-spacing: -0.5px; }
+  header h1 span { color: var(--accent); }
+  header p { color: var(--muted); margin-top: 6px; font-size: 0.9rem; }
+  header a { color: var(--accent); text-decoration: none; }
+  header a:hover { text-decoration: underline; }
+
+  .layout { display: grid; grid-template-columns: 320px 1fr; gap: 20px; padding: 20px 32px 32px; max-width: 1400px; margin: 0 auto; align-items: start; }
+
+  /* ── CONTROLS ── */
+  .controls { display: flex; flex-direction: column; gap: 14px; position: sticky; top: 20px; max-height: calc(100vh - 40px); overflow-y: auto; scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+  .card h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 12px; }
+
+  .field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+  .field:last-child { margin-bottom: 0; }
+  .field label { font-size: 0.8rem; color: var(--muted); display: flex; justify-content: space-between; }
+  .field label span { color: var(--accent); font-weight: 600; }
+  .field input[type=range] { width: 100%; accent-color: var(--accent); cursor: pointer; }
+  .field select { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; color: var(--text); padding: 5px 8px; font-size: 0.85rem; width: 100%; cursor: pointer; }
+  .field select:focus { outline: 1px solid var(--accent); }
+
+  .toggle-row { display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 0.85rem; }
+  .toggle-row:last-child { margin-bottom: 0; }
+  .toggle { position: relative; width: 36px; height: 20px; flex-shrink: 0; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle .slider { position: absolute; inset: 0; background: var(--border); border-radius: 20px; cursor: pointer; transition: background 0.2s; }
+  .toggle .slider::before { content: ''; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: #fff; border-radius: 50%; transition: transform 0.2s; }
+  .toggle input:checked + .slider { background: var(--accent); }
+  .toggle input:checked + .slider::before { transform: translateX(16px); }
+
+  .btn-group { display: flex; gap: 8px; flex-wrap: wrap; }
+  button { padding: 7px 14px; border-radius: 5px; border: 1px solid var(--border); font-size: 0.85rem; cursor: pointer; font-family: var(--font); transition: background 0.15s, border-color 0.15s; }
+  .btn-primary { background: var(--accent); color: #0d1117; border-color: var(--accent); font-weight: 600; }
+  .btn-primary:hover { background: #79c0ff; }
+  .btn-secondary { background: transparent; color: var(--text); }
+  .btn-secondary:hover { background: var(--border); }
+  .btn-danger { background: transparent; color: var(--red); border-color: var(--red); }
+  .btn-danger:hover { background: #3d1a1a; }
+  .btn-sm { padding: 4px 10px; font-size: 0.78rem; }
+
+  .instance-list { display: flex; flex-direction: column; gap: 6px; }
+  .instance-chip { display: flex; align-items: center; justify-content: space-between; background: var(--bg); border: 1px solid var(--border); border-radius: 5px; padding: 5px 10px; font-size: 0.8rem; }
+  .instance-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; margin-right: 8px; }
+
+  /* ── MAIN VIZ ── */
+  .viz { display: flex; flex-direction: column; gap: 16px; }
+
+  .stats-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+  .stat { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 16px; }
+  .stat .label { font-size: 0.72rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.07em; }
+  .stat .value { font-size: 1.5rem; font-weight: 700; margin-top: 2px; }
+  .stat .value.green { color: var(--green); }
+  .stat .value.orange { color: var(--orange); }
+  .stat .value.muted { color: var(--muted); }
+
+  /* shard grid */
+  .shard-grid-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+  .shard-grid-wrap h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 12px; }
+  .shard-grid { display: flex; flex-wrap: wrap; gap: 3px; }
+  .shard-cell {
+    width: 12px; height: 12px; border-radius: 2px; flex-shrink: 0;
+    border: 1px solid transparent;
+    transition: background 0.2s, border-color 0.2s, transform 0.15s;
+    position: relative; cursor: default;
+  }
+  .shard-cell.free { background: #1c2128; border-color: #21262d; }
+  .shard-cell.held { border-color: transparent; }
+  .shard-cell.working { transform: scale(1.4); z-index: 1; border-color: #fff5 !important; }
+  .shard-cell.expiring { border-color: var(--orange) !important; }
+  .shard-cell.releasing { opacity: 0.35; transform: scale(0.7); }
+
+  /* pulse ring on working shard */
+  @keyframes pulse-ring {
+    0%   { box-shadow: 0 0 0 0px rgba(255,255,255,0.5); }
+    70%  { box-shadow: 0 0 0 4px rgba(255,255,255,0); }
+    100% { box-shadow: 0 0 0 0px rgba(255,255,255,0); }
+  }
+  .shard-cell.working { animation: pulse-ring 0.8s ease-out infinite; }
+
+  /* instance section */
+  .instances-section { display: flex; flex-direction: column; gap: 10px; }
+  .instance-card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .instance-header { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .instance-header .dot { width: 12px; height: 12px; border-radius: 50%; flex-shrink: 0; }
+  .instance-header .iid { font-size: 0.82rem; font-family: monospace; color: var(--accent); }
+  .instance-header .badges { margin-left: auto; display: flex; gap: 6px; }
+  .badge { padding: 2px 8px; border-radius: 20px; font-size: 0.7rem; font-weight: 600; }
+  .badge-green { background: #1a3a1a; color: var(--green); border: 1px solid #2a5a2a; }
+  .badge-orange { background: #3a2a0a; color: var(--orange); border: 1px solid #5a4010; }
+  .badge-red { background: #3a1010; color: var(--red); border: 1px solid #5a2020; }
+  .badge-muted { background: #1c2128; color: var(--muted); border: 1px solid var(--border); }
+  .instance-shards { display: flex; flex-wrap: wrap; gap: 4px; }
+  .mini-shard { width: 28px; height: 28px; border-radius: 4px; display: flex; align-items: center; justify-content: center; font-size: 0.65rem; font-weight: 700; color: #0d1117; }
+  .instance-timeline { margin-top: 10px; }
+  .timeline-bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--border); gap: 1px; }
+  .timeline-seg { flex-shrink: 0; border-radius: 2px; transition: width 0.3s; }
+
+  /* event log */
+  .log-wrap { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; }
+  .log-wrap h3 { font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
+  .log { font-family: monospace; font-size: 0.75rem; height: 160px; overflow-y: auto; display: flex; flex-direction: column-reverse; gap: 2px; }
+  .log-entry { padding: 2px 4px; border-radius: 3px; opacity: 1; transition: opacity 1s; }
+  .log-entry.acquired { color: var(--green); }
+  .log-entry.released { color: var(--muted); }
+  .log-entry.heartbeat { color: #58a6ff88; }
+  .log-entry.stolen { color: var(--orange); }
+  .log-entry.faulted { color: var(--red); }
+  .log-entry.working { color: #c9d1d9; }
+  .log-entry.instance { color: var(--accent); }
+
+  /* tooltip — rendered in a fixed overlay, not inside the cell */
+  #shardTooltip { display: none; position: fixed; background: #2d333b; border: 1px solid var(--border); border-radius: 5px; padding: 5px 9px; font-size: 0.72rem; white-space: nowrap; z-index: 1000; color: var(--text); pointer-events: none; }
+
+  /* speed control */
+  .speed-row { display: flex; align-items: center; gap: 10px; font-size: 0.82rem; color: var(--muted); }
+  .speed-row span { min-width: 30px; color: var(--accent); font-weight: 600; }
+
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    .stats-row { grid-template-columns: repeat(2,1fr); }
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1><span>ShardWorker</span> – Interactive Demo</h1>
+  <p>Visualise how distributed shard locking works. Adjust config, add/remove instances, and watch in real time. &nbsp;·&nbsp; <a href="https://github.com/jayarrowz/ShardWorker" target="_blank">GitHub ↗</a></p>
+</header>
+
+<div class="layout">
+  <!-- ── LEFT PANEL ── -->
+  <div class="controls">
+
+    <div class="card">
+      <h3>Simulation Speed</h3>
+      <div class="speed-row">
+        Slow
+        <input type="range" id="speedSlider" min="0.25" max="8" step="0.25" value="0.25" style="flex:1">
+        Fast
+        <span id="speedVal">0.25×</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Shard Config</h3>
+      <div class="field">
+        <label>Total Shards <span id="lbl-totalShards">1000</span></label>
+        <input type="range" id="totalShards" min="4" max="1000" step="1" value="1000">
+      </div>
+      <div class="field">
+        <label>Max Shards / Instance <span id="lbl-maxPerInstance">40</span></label>
+        <input type="range" id="maxPerInstance" min="1" max="100" step="1" value="40">
+      </div>
+      <div class="field">
+        <label>Worker Concurrency <span id="lbl-concurrency">2</span></label>
+        <input type="range" id="concurrency" min="1" max="4" step="1" value="2">
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Timing (simulated seconds)</h3>
+      <div class="field">
+        <label>Acquire Interval <span id="lbl-acquireInterval">1s</span></label>
+        <input type="range" id="acquireInterval" min="1" max="20" step="1" value="1">
+      </div>
+      <div class="field">
+        <label>Heartbeat Interval <span id="lbl-heartbeatInterval">6s</span></label>
+        <input type="range" id="heartbeatInterval" min="2" max="20" step="1" value="6">
+      </div>
+      <div class="field">
+        <label>Lock Expiry <span id="lbl-lockExpiry">20s</span></label>
+        <input type="range" id="lockExpiry" min="5" max="60" step="1" value="20">
+      </div>
+      <div class="field">
+        <label>Worker Interval <span id="lbl-workerInterval">1s</span></label>
+        <input type="range" id="workerInterval" min="1" max="15" step="1" value="1">
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Work Items</h3>
+      <div class="field">
+        <label>Total Work Items <span id="lbl-workItems">100000</span></label>
+        <input type="range" id="workItems" min="0" max="100000" step="100" value="100000">
+      </div>
+      <div class="field">
+        <label>Fault Rate <span id="lbl-faultRate">0%</span></label>
+        <input type="range" id="faultRate" min="0" max="50" step="1" value="0">
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Behaviour</h3>
+      <div class="toggle-row">
+        <span>Release On Completion</span>
+        <label class="toggle"><input type="checkbox" id="releaseOnCompletion" checked><span class="slider"></span></label>
+      </div>
+      <div class="toggle-row">
+        <span>Release On Throws</span>
+        <label class="toggle"><input type="checkbox" id="releaseOnThrows"><span class="slider"></span></label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Instances</h3>
+      <div class="instance-list" id="instanceList"></div>
+      <div class="btn-group" style="margin-top:10px">
+        <button class="btn-primary btn-sm" id="addInstance">+ Add Instance</button>
+        <button class="btn-secondary btn-sm" id="resetBtn">↺ Reset</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ── RIGHT PANEL ── -->
+  <div class="viz">
+
+    <div class="stats-row">
+      <div class="stat"><div class="label">Total Shards</div><div class="value" id="stat-total">–</div></div>
+      <div class="stat"><div class="label">Held</div><div class="value green" id="stat-held">–</div></div>
+      <div class="stat"><div class="label">Free</div><div class="value muted" id="stat-free">–</div></div>
+      <div class="stat"><div class="label">Work Done</div><div class="value orange" id="stat-done">–</div></div>
+    </div>
+
+    <div class="shard-grid-wrap">
+      <h3>Shard Grid</h3>
+      <div class="shard-grid" id="shardGrid"></div>
+    </div>
+    <div id="shardTooltip"></div>
+
+    <div class="instances-section" id="instanceCards"></div>
+
+    <div class="log-wrap">
+      <h3>Event Log <button class="btn-secondary btn-sm" id="clearLog" style="font-size:0.7rem;padding:2px 8px">Clear</button></h3>
+      <div class="log" id="eventLog"></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+const PALETTE = [
+  '#f97316','#a78bfa','#34d399','#fb7185','#38bdf8',
+  '#facc15','#e879f9','#4ade80','#f472b6','#60a5fa',
+  '#fb923c','#818cf8',
+];
+
+let cfg = {
+  totalShards: 1000,
+  maxPerInstance: 40,
+  concurrency: 2,
+  acquireInterval: 1,
+  heartbeatInterval: 6,
+  lockExpiry: 20,
+  workerInterval: 1,
+  workItems: 100000,
+  faultRate: 0,
+  releaseOnCompletion: true,
+  releaseOnThrows: false,
+};
+
+let simTime = 0;           // simulated seconds elapsed
+let speed = 0.25;          // sim-seconds per real-second
+let running = false;
+let rafId = null;
+let lastRealTs = null;
+
+// instance state
+let instances = [];        // { id, color, shards: Map<shardIdx, shardState>, cursor, alive }
+// shardState = { expiresAt, working, workingUntil, concurrentSlots }
+
+// lock table: shardIdx → { instanceId, expiresAt }
+let lockTable = new Map(); // Map<shardIdx, { instanceId, expiresAt }>
+
+// work items: array of { id, shardIdx, status: 'pending'|'done'|'failed' }
+let workItems = [];
+let workItemsById = new Map();       // id → item  (O(1) lookup)
+let pendingByShardIdx = new Map();   // shardIdx → Set<itemId>  (fast per-shard query)
+let workDone = 0;
+
+let nextInstanceId = 1;
+let logEntries = [];
+
+function rng() { return Math.random(); }
+function randInt(a, b) { return Math.floor(rng() * (b - a + 1)) + a; }
+
+function reset() {
+  simTime = 0;
+  lockTable.clear();
+  instances = [];
+  nextInstanceId = 1;
+  workDone = 0;
+  logEntries = [];
+  rebuildWorkItems();
+  addInstance(); addInstance(); addInstance(); addInstance();
+  renderAll();
+}
+
+function rebuildWorkItems() {
+  workItems = [];
+  workItemsById.clear();
+  pendingByShardIdx.clear();
+  for (let i = 0; i < cfg.workItems; i++) {
+    const si = i % cfg.totalShards;
+    const item = { id: i, shardIdx: si, status: 'pending' };
+    workItems.push(item);
+    workItemsById.set(i, item);
+    if (!pendingByShardIdx.has(si)) pendingByShardIdx.set(si, new Set());
+    pendingByShardIdx.get(si).add(i);
+  }
+  workDone = 0;
+}
+
+function addInstance() {
+  const color = PALETTE[(nextInstanceId - 1) % PALETTE.length];
+  const cursor = randInt(0, cfg.totalShards - 1);
+  instances.push({
+    id: 'inst-' + (nextInstanceId++).toString(16).padStart(3,'0'),
+    color,
+    shards: new Map(),
+    cursor,
+    alive: true,
+    lastAcquire: -999,
+    lastHeartbeat: -999,
+    workDone: 0,
+    faults: 0,
+  });
+  log(`New instance ${instances[instances.length-1].id} joined`, 'instance');
+  renderInstanceList();
+}
+
+function removeInstance(id) {
+  const inst = instances.find(i => i.id === id);
+  if (!inst) return;
+  // release all locks
+  for (const [si] of inst.shards) {
+    lockTable.delete(si);
+    log(`${id} released shard ${si} (shutdown)`, 'released');
+  }
+  inst.shards.clear();
+  inst.alive = false;
+  instances = instances.filter(i => i.id !== id);
+  log(`Instance ${id} removed`, 'instance');
+  renderAll();
+}
+
+function tick(dt) {
+  simTime += dt;
+
+  // Expire stale locks first
+  for (const [si, lock] of lockTable.entries()) {
+    if (lock.expiresAt <= simTime) {
+      const inst = instances.find(i => i.id === lock.instanceId);
+      if (inst) {
+        inst.shards.delete(si);
+        log(`Shard ${si} lock expired (stolen from ${inst.id})`, 'stolen');
+      }
+      lockTable.delete(si);
+    }
+  }
+
+  for (const inst of instances) {
+    if (!inst.alive) continue;
+
+    // ── HEARTBEAT ──
+    if (simTime - inst.lastHeartbeat >= cfg.heartbeatInterval) {
+      inst.lastHeartbeat = simTime;
+      // renew all held shards
+      for (const [si] of inst.shards) {
+        const lock = lockTable.get(si);
+        if (lock && lock.instanceId === inst.id) {
+          lock.expiresAt = simTime + cfg.lockExpiry;
+        }
+      }
+      if (inst.shards.size > 0) log(`[heartbeat] ${inst.id} renewed ${inst.shards.size} shard(s)`, 'heartbeat');
+    }
+
+    // ── ACQUIRE ──
+    if (simTime - inst.lastAcquire >= cfg.acquireInterval) {
+      inst.lastAcquire = simTime;
+      const capacity = cfg.maxPerInstance - inst.shards.size;
+      if (capacity > 0) {
+        const candidates = [];
+        for (let i = 0; i < cfg.totalShards && candidates.length < capacity; i++) {
+          const si = (inst.cursor + i) % cfg.totalShards;
+          if (!lockTable.has(si) || lockTable.get(si).expiresAt <= simTime) {
+            if (!inst.shards.has(si)) candidates.push(si);
+          }
+        }
+        inst.cursor = (inst.cursor + Math.max(1, candidates.length)) % cfg.totalShards;
+
+        for (const si of candidates) {
+          lockTable.set(si, { instanceId: inst.id, expiresAt: simTime + cfg.lockExpiry });
+          inst.shards.set(si, { expiresAt: simTime + cfg.lockExpiry, working: false, workingUntil: 0, slots: 0 });
+          log(`${inst.id} acquired shard ${si}`, 'acquired');
+        }
+      }
+    }
+
+    // ── WORKER EXECUTION ──
+    for (const [si, ss] of inst.shards) {
+      // for each concurrency slot
+      const maxSlots = cfg.concurrency;
+      const activeSlots = ss.slots || 0;
+
+      for (let slot = activeSlots; slot < maxSlots; slot++) {
+        // start a new slot if worker interval has passed since shard was last idle
+        const shouldStart = !ss.working || cfg.concurrency > 1;
+        if (shouldStart && (simTime >= ss.workingUntil || !ss.working)) {
+          // collect ALL pending items for this shard (mirrors the real worker batch)
+          const pendingIds = [...(pendingByShardIdx.get(si) || [])];
+          const fault = rng() * 100 < cfg.faultRate;
+          const workDuration = 0.5 + rng() * cfg.workerInterval;
+
+          ss.working = true;
+          ss.workingUntil = simTime + workDuration;
+          ss.slots = maxSlots;
+          ss._items = pendingIds;
+          ss._fault = fault;
+
+          if (pendingIds.length > 0) log(`${inst.id}/shard${si} processing ${pendingIds.length} item(s)`, 'working');
+          break; // one start per tick per shard
+        }
+      }
+
+      // complete work
+      if (ss.working && simTime >= ss.workingUntil) {
+        const itemIds = ss._items || [];
+        const fault = ss._fault;
+
+        if (fault) {
+          // mark all captured items failed
+          for (const id of itemIds) {
+            const item = workItemsById.get(id);
+            if (item && item.status === 'pending') {
+              item.status = 'failed';
+              pendingByShardIdx.get(item.shardIdx)?.delete(id);
+            }
+          }
+          inst.faults++;
+          log(`${inst.id}/shard${si} FAULTED on ${itemIds.length} item(s)`, 'faulted');
+          if (cfg.releaseOnThrows) {
+            lockTable.delete(si);
+            inst.shards.delete(si);
+            log(`${inst.id} released shard ${si} (ReleaseOnThrows)`, 'released');
+            break;
+          }
+        } else {
+          // mark all captured items done
+          let count = 0;
+          for (const id of itemIds) {
+            const item = workItemsById.get(id);
+            if (item && item.status === 'pending') {
+              item.status = 'done';
+              pendingByShardIdx.get(item.shardIdx)?.delete(id);
+              count++;
+            }
+          }
+          workDone += count;
+          inst.workDone += count;
+          if (cfg.releaseOnCompletion) {
+            lockTable.delete(si);
+            inst.shards.delete(si);
+            log(`${inst.id} released shard ${si} (ReleaseOnCompletion)`, 'released');
+            break;
+          }
+        }
+
+        ss.working = false;
+        ss.slots = 0;
+        ss._items = null;
+        ss.workingUntil = simTime + cfg.workerInterval;
+      }
+    }
+  }
+}
+
+function renderAll() {
+  renderStats();
+  renderGrid();
+  renderInstanceCards();
+  renderInstanceList();
+  renderLog();
+}
+
+function renderStats() {
+  const held = lockTable.size;
+  document.getElementById('stat-total').textContent = cfg.totalShards;
+  document.getElementById('stat-held').textContent = held;
+  document.getElementById('stat-free').textContent = cfg.totalShards - held;
+  document.getElementById('stat-done').textContent = workDone + ' / ' + cfg.workItems;
+}
+
+function renderGrid() {
+  const grid = document.getElementById('shardGrid');
+  // update or create cells
+  while (grid.children.length > cfg.totalShards) grid.removeChild(grid.lastChild);
+  for (let si = 0; si < cfg.totalShards; si++) {
+    let cell = grid.children[si];
+    if (!cell) {
+      cell = document.createElement('div');
+      cell.className = 'shard-cell';
+      grid.appendChild(cell);
+    }
+
+    const lock = lockTable.get(si);
+
+    if (!lock) {
+      cell.className = 'shard-cell free';
+      cell.style.background = '';
+      cell._tipText = `Shard ${si} — free`;
+    } else {
+      const inst = instances.find(i => i.id === lock.instanceId);
+      const color = inst ? inst.color : '#888';
+      const ss = inst ? inst.shards.get(si) : null;
+      const isWorking = ss && ss.working;
+      const expiring = lock.expiresAt - simTime < cfg.lockExpiry * 0.15;
+
+      let cls = 'shard-cell held';
+      if (isWorking) cls += ' working';
+      if (expiring) cls += ' expiring';
+      cell.className = cls;
+      cell.style.background = color;
+      cell._tipText = `Shard ${si} · ${lock.instanceId} · exp in ${(lock.expiresAt - simTime).toFixed(1)}s`;
+    }
+  }
+}
+
+function renderInstanceCards() {
+  const container = document.getElementById('instanceCards');
+  const existing = new Map([...container.children].map(el => [el.dataset.id, el]));
+
+  // remove dead
+  for (const [id, el] of existing) {
+    if (!instances.find(i => i.id === id)) container.removeChild(el);
+  }
+
+  for (const inst of instances) {
+    let card = existing.get(inst.id);
+    if (!card) {
+      // Build structure ONCE — the kill button is never replaced
+      card = document.createElement('div');
+      card.className = 'instance-card';
+      card.dataset.id = inst.id;
+      card.innerHTML = `
+        <div class="instance-header">
+          <div class="dot" style="background:${inst.color}"></div>
+          <div class="iid">${inst.id}</div>
+          <div class="badges"></div>
+          <button data-kill="${inst.id}" style="margin-left:8px;background:transparent;border:none;color:var(--muted);cursor:pointer;font-size:1rem;padding:0 4px" title="Kill instance">✕</button>
+        </div>
+        <div class="instance-shards"></div>
+      `;
+      container.appendChild(card);
+    }
+
+    // Update only the dynamic parts each frame
+    const held = [...inst.shards.keys()];
+    const working = held.filter(si => { const ss = inst.shards.get(si); return ss && ss.working; });
+
+    card.querySelector('.badges').innerHTML =
+      (held.length ? `<span class="badge badge-green">${held.length} held</span>` : '') +
+      (working.length ? `<span class="badge badge-orange">${working.length} working</span>` : '') +
+      (inst.faults ? `<span class="badge badge-red">${inst.faults} fault${inst.faults>1?'s':''}</span>` : '') +
+      `<span class="badge badge-muted">${inst.workDone} done</span>`;
+
+    card.querySelector('.instance-shards').innerHTML =
+      held.length === 0 ? '<span style="color:var(--muted);font-size:0.75rem">No shards held</span>' :
+        held.sort((a,b)=>a-b).map(si => {
+          const ss = inst.shards.get(si);
+          const isWorking = ss && ss.working;
+          return `<div class="mini-shard${isWorking?' working':''}" style="background:${inst.color};${isWorking?'outline:2px solid #fff4;outline-offset:1px':''}">${si}</div>`;
+        }).join('');
+  }
+}
+
+function renderInstanceList() {
+  const list = document.getElementById('instanceList');
+  list.innerHTML = instances.map(inst => `
+    <div class="instance-chip">
+      <span class="instance-dot" style="background:${inst.color}"></span>
+      <span style="font-family:monospace;font-size:0.78rem">${inst.id}</span>
+      <span style="color:var(--muted);font-size:0.75rem">${inst.shards.size} shards</span>
+    </div>
+  `).join('');
+}
+
+function renderLog() {
+  const logEl = document.getElementById('eventLog');
+  logEl.innerHTML = logEntries.slice(-80).reverse().map(e =>
+    `<div class="log-entry ${e.type}">[${e.time.toFixed(1)}s] ${e.msg}</div>`
+  ).join('');
+}
+
+function log(msg, type = 'info') {
+  logEntries.push({ msg, type, time: simTime });
+  if (logEntries.length > 300) logEntries.shift();
+}
+
+function loop(now) {
+  if (!running) return;
+  const dtReal = lastRealTs === null ? 0 : (now - lastRealTs) / 1000;
+  lastRealTs = now;
+  const dtSim = dtReal * speed;
+  tick(dtSim);
+  renderAll();
+  rafId = requestAnimationFrame(loop);
+}
+
+function start() {
+  if (running) return;
+  running = true;
+  lastRealTs = null;
+  rafId = requestAnimationFrame(loop);
+}
+start(); // auto-start
+
+function bindSlider(id, key, fmt) {
+  const el = document.getElementById(id);
+  const lbl = document.getElementById('lbl-' + id);
+  el.value = cfg[key];
+  lbl.textContent = fmt(cfg[key]);
+  el.addEventListener('input', () => {
+    cfg[key] = +el.value;
+    lbl.textContent = fmt(+el.value);
+  });
+}
+
+bindSlider('totalShards',      'totalShards',      v => v);
+bindSlider('maxPerInstance',   'maxPerInstance',   v => v === 30 ? '∞' : v);
+bindSlider('concurrency',      'concurrency',      v => v);
+bindSlider('acquireInterval',  'acquireInterval',  v => v + 's');
+bindSlider('heartbeatInterval','heartbeatInterval',v => v + 's');
+bindSlider('lockExpiry',       'lockExpiry',       v => v + 's');
+bindSlider('workerInterval',   'workerInterval',   v => v + 's');
+bindSlider('workItems',        'workItems',        v => v);
+bindSlider('faultRate',        'faultRate',        v => v + '%');
+
+document.getElementById('maxPerInstance').max = 100;
+
+document.getElementById('releaseOnCompletion').addEventListener('change', e => { cfg.releaseOnCompletion = e.target.checked; });
+document.getElementById('releaseOnThrows').addEventListener('change', e => { cfg.releaseOnThrows = e.target.checked; });
+
+document.getElementById('speedSlider').addEventListener('input', e => {
+  speed = +e.target.value;
+  document.getElementById('speedVal').textContent = speed + '×';
+});
+
+document.getElementById('addInstance').addEventListener('click', addInstance);
+document.getElementById('resetBtn').addEventListener('click', reset);
+document.getElementById('clearLog').addEventListener('click', () => { logEntries = []; renderLog(); });
+
+// watch totalShards change → rebuild grid + work items
+document.getElementById('instanceCards').addEventListener('click', e => {
+  const btn = e.target.closest('[data-kill]');
+  if (btn) removeInstance(btn.dataset.kill);
+});
+
+document.getElementById('totalShards').addEventListener('change', () => {
+  rebuildWorkItems();
+  // update maxPerInstance max
+  document.getElementById('maxPerInstance').max = Math.min(cfg.totalShards, 100);
+  renderAll();
+});
+document.getElementById('workItems').addEventListener('change', () => {
+  rebuildWorkItems();
+});
+
+(function() {
+  const tip = document.getElementById('shardTooltip');
+  document.getElementById('shardGrid').addEventListener('mousemove', e => {
+    const cell = e.target.closest('.shard-cell');
+    if (!cell || !cell._tipText) { tip.style.display = 'none'; return; }
+    tip.textContent = cell._tipText;
+    tip.style.display = 'block';
+    tip.style.left = (e.clientX + 14) + 'px';
+    tip.style.top  = (e.clientY - 28) + 'px';
+  });
+  document.getElementById('shardGrid').addEventListener('mouseleave', () => {
+    tip.style.display = 'none';
+  });
+})();
+
+reset();
+</script>
+</body>
+</html>
