@@ -4,7 +4,7 @@
 [![NuGet](https://img.shields.io/nuget/v/ShardWorker.svg)](https://www.nuget.org/packages/ShardWorker)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow.svg)](https://buymeacoffee.com/jayarrowz)
 
-A lightweight .NET library for running distributed, sharded background workers coordinated by database locks. Multiple instances of your application compete for ownership of numbered shards; each shard is processed by exactly one instance at a time.
+Running background jobs across multiple instances? ShardWorker splits work into shards so each instance processes its own slice, coordinated by your existing database. No Redis, no message broker, no extra infrastructure.
 
 ## How it works
 
