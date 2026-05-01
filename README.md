@@ -4,7 +4,7 @@
 [![NuGet](https://img.shields.io/nuget/v/ShardWorker.svg)](https://www.nuget.org/packages/ShardWorker)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow.svg)](https://buymeacoffee.com/jayarrowz)
 
-Running background jobs across multiple instances? ShardWorker splits work into shards so each instance processes its own slice, coordinated by your existing database. No Redis, no message broker, no extra infrastructure.
+Running background jobs across multiple instances? ShardWorker splits work into shards so each instance processes its own slice, coordinated by your existing database. No Redis, no message broker, no extra infrastructure. See a simulation here: https://jayarrowz.github.io/ShardWorker/
 
 ## How it works
 
