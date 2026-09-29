@@ -15,5 +15,6 @@ internal sealed class NullShardEngineObserver : IShardEngineObserver
     public void OnShardAcquired(string workerName, string instanceId, int shardIndex) { }
     public void OnShardReleased(string workerName, string instanceId, int shardIndex) { }
     public void OnShardStolen(string workerName, string instanceId, int shardIndex) { }
+    public void OnShardLeaseLost(string workerName, string instanceId, int shardIndex) { }
     public void OnWorkerFaulted(string workerName, string instanceId, int shardIndex, Exception exception) { }
 }

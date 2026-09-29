@@ -22,6 +22,9 @@ internal sealed class CompositeShardEngineObserver : IShardEngineObserver
     public void OnShardStolen(string workerName, string instanceId, int shardIndex)
         => Invoke(o => o.OnShardStolen(workerName, instanceId, shardIndex));
 
+    public void OnShardLeaseLost(string workerName, string instanceId, int shardIndex)
+        => Invoke(o => o.OnShardLeaseLost(workerName, instanceId, shardIndex));
+
     public void OnWorkerFaulted(string workerName, string instanceId, int shardIndex, Exception exception)
         => Invoke(o => o.OnWorkerFaulted(workerName, instanceId, shardIndex, exception));
 

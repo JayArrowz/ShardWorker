@@ -18,6 +18,9 @@ public sealed partial class ShardEngineTests
         public void OnShardStolen(string workerName, string instanceId, int shardIndex) =>
             Events.Add(("Stolen", workerName, instanceId, shardIndex));
 
+        public void OnShardLeaseLost(string workerName, string instanceId, int shardIndex) =>
+            Events.Add(("LeaseLost", workerName, instanceId, shardIndex));
+
         public void OnWorkerFaulted(string workerName, string instanceId, int shardIndex, Exception exception) =>
             Events.Add(("Faulted", workerName, instanceId, shardIndex));
     }

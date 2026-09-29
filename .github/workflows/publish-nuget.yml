@@ -11,8 +11,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  actions: read
+  contents: read
 
 env:
   DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
@@ -59,7 +58,11 @@ jobs:
     name: Publish NuGet Packages
     runs-on: ubuntu-latest
     needs: validate-release
+    # Must match the environment on the nuget.org trusted publishing policy.
     environment: production
+    permissions:
+      contents: write   # upload .nupkg files to the GitHub release
+      id-token: write   # request the OIDC token exchanged for a NuGet API key
 
     steps:
       - name: Checkout
@@ -141,9 +144,18 @@ jobs:
 
           if [ "$ALL_OK" != "true" ]; then exit 1; fi
 
+      # Trusted publishing: exchanges this job's GitHub OIDC token for a short-lived
+      # (1 hour) NuGet API key, so no long-lived key is stored in repository secrets.
+      # Kept immediately before the push so the key cannot expire in between.
+      - name: NuGet login (trusted publishing)
+        id: nuget_login
+        uses: NuGet/login@v1
+        with:
+          user: JayArrowz
+
       - name: Publish to NuGet.org
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget_login.outputs.NUGET_API_KEY }}
         run: |
           echo "🚀 Publishing packages to NuGet.org..."
           for pkg in ./artifacts/*.nupkg; do

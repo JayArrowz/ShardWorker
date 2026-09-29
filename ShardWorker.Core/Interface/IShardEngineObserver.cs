@@ -30,6 +30,13 @@ public interface IShardEngineObserver
     void OnShardStolen(string workerName, string instanceId, int shardIndex);
 
     /// <summary>
+    /// Called when a shard's worker is stopped because its lease could not be renewed in time
+    /// (renewals failed or hung, typically because the lock database is unreachable). Unlike
+    /// <see cref="OnShardStolen"/>, no other instance is known to own the shard yet.
+    /// </summary>
+    void OnShardLeaseLost(string workerName, string instanceId, int shardIndex);
+
+    /// <summary>
     /// Called each time <c>ExecuteAsync</c> throws an unhandled exception on a shard.
     /// </summary>
     void OnWorkerFaulted(string workerName, string instanceId, int shardIndex, Exception exception);

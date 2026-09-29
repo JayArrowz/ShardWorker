@@ -8,7 +8,7 @@ Running background jobs across multiple instances? ShardWorker splits work into 
 
 ## How it works
 
-The total workload is divided into **N shards** (numbered `0` to `N-1`). Every running instance continuously tries to acquire shard locks via the configured `IShardLockProvider`. Once a shard is acquired, a worker loop is started for it. A heartbeat loop renews held locks in the background. If a lock renewal fails (e.g. the instance was too slow), the worker for that shard is stopped and the shard becomes available for another instance to claim.
+The total workload is divided into **N shards** (numbered `0` to `N-1`). Every running instance continuously tries to acquire shard locks via the configured `IShardLockProvider`. Once a shard is acquired, a worker loop is started for it. A heartbeat loop renews held locks in the background. If a renewal shows the lock now belongs to another instance, the worker for that shard is stopped. If renewals keep failing outright (e.g. the database is unreachable), the worker is stopped shortly *before* its lease would expire, so it is not still running when another instance claims the shard. See [Lease safety](#lease-safety).
 
 ```
 Instance A (cursor offset 3) Instance B (cursor offset 17)
@@ -59,6 +59,7 @@ Each `AddShardEngine<TWorker>` registration is fully independent: its own `Backg
 - **Lower `AcquireInterval`** → faster rebalancing after an instance dies or joins. The cost is still one DB round-trip per interval.
 - **Lower `HeartbeatInterval`** → locks renew more frequently, reducing the window where a slow instance's shards expire and get stolen. Must stay below `LockExpiry`.
 - **`LockExpiry`** is the maximum time a shard is unavailable after its owning instance crashes. Set it to the longest acceptable gap in processing.
+- **`LeaseSafetyMargin`** (default `LockExpiry / 5`) is how long before expiry a shard's worker is cancelled when renewals keep failing. Make it larger than the time your worker takes to notice cancellation. Keep `2 × HeartbeatInterval + LeaseSafetyMargin < LockExpiry`, so one failed heartbeat can be retried before any worker is stopped; the engine logs a warning at startup if it is not.
 - **`MaxShardsPerInstance`** caps how many shards one instance holds. Use it when you want to guarantee headroom for other instances (e.g. `TotalShards=30`, `MaxShardsPerInstance=10` → at least 3 instances needed to cover all shards). Each instance walks shards in a round-robin order starting from a random cursor offset chosen at startup, so instances naturally spread across different parts of the index range rather than all competing for the same shards each cycle. Every shard gets equal opportunity — a fast-completing shard won't be re-acquired ahead of shards that haven't been visited yet.
 - **`ReleaseOnCompletion`** turns the library into a task-queue style dispatcher — see below.
 - **`ReleaseOnThrows`** releases a shard after an unhandled exception, letting another instance retry rather than the same instance looping.
@@ -456,6 +457,7 @@ All options live in `ShardWorkerOptions`. Each worker type can have its own valu
 | `TotalShards` | `10` | Total shards divided across all instances |
 | `LockExpiry` | `2 min` | How long a lock row lives before another instance may steal it |
 | `HeartbeatInterval` | `30 s` | How often held shards are renewed. Must be less than `LockExpiry` |
+| `LeaseSafetyMargin` | `LockExpiry / 5` | When renewals keep failing, a shard's worker is cancelled this long before its lease would expire. See [Lease safety](#lease-safety) |
 | `AcquireInterval` | `15 s` | How often to scan for unowned/expired shards |
 | `WorkerInterval` | `30 s` | Pause between consecutive `ExecuteAsync` calls on the same shard (per slot) |
 | `ShutdownTimeout` | `30 s` | How long `StopAsync` waits for in-flight workers before giving up |
@@ -467,8 +469,24 @@ All options live in `ShardWorkerOptions`. Each worker type can have its own valu
 
 > **Startup validation rules:** The engine throws `InvalidOperationException` at startup if:
 > - `HeartbeatInterval >= LockExpiry`
+> - `LeaseSafetyMargin <= 0`
+> - `HeartbeatInterval + LeaseSafetyMargin >= LockExpiry` (every lease would lapse before its first renewal)
 > - `TotalShards <= 0`
 > - `WorkerConcurrency <= 0`
+
+---
+
+## Lease safety
+
+Each held shard has a local deadline, timed with a monotonic clock from the moment the last successful acquire or renew request was **sent**. The database stamps `expires_at` no earlier than that, so the local deadline never runs past the real one. The deadline is `LockExpiry − LeaseSafetyMargin` after that send time. If it passes without a successful renewal, the engine:
+
+1. Cancels that shard's worker and calls `IShardEngineObserver.OnShardLeaseLost`.
+2. Keeps the shard marked as held until the worker has actually exited, so this instance cannot start a second worker for it in the meantime.
+3. Tries to release the lock once the worker exits. If the database is still unreachable this fails harmlessly and the row expires on its own.
+
+The deadline is enforced by a timer that does not depend on the heartbeat loop. A renewal call that hangs, even one that ignores its cancellation token, cannot keep a worker alive past its lease. Renewal calls are also cancelled at the earliest deadline among the shards they cover, so a hung connection does not stall the heartbeat loop.
+
+> **Cancellation is cooperative.** A worker in the middle of a write will not see the cancellation until it next checks its token, so there is still a short window in which two instances can process the same shard. `LeaseSafetyMargin` shrinks that window but cannot close it. If overlap must be impossible, guard the resource you write to with a fencing check (for example, a per-shard version or token column updated with compare-and-set).
 
 ---
 
@@ -613,7 +631,7 @@ On `IHost` shutdown the engine:
 
 ## Observability
 
-`ShardWorker` fires structured log messages at every significant lifecycle event (acquire, release, stolen lock, worker fault). For metric-level telemetry, add the optional `ShardWorker.Observability` package which publishes counters via `System.Diagnostics.Metrics` — compatible with OpenTelemetry, Prometheus exporters, and `dotnet-counters`.
+`ShardWorker` fires structured log messages at every significant lifecycle event (acquire, release, stolen lock, lost lease, worker fault). For metric-level telemetry, add the optional `ShardWorker.Observability` package which publishes counters via `System.Diagnostics.Metrics` — compatible with OpenTelemetry, Prometheus exporters, and `dotnet-counters`.
 
 ### Metrics
 
@@ -630,6 +648,7 @@ This registers `MetricsShardEngineObserver` and exposes the following counters u
 | `shardworker.shards.acquired` | Counter | Shard lock acquired by this instance |
 | `shardworker.shards.released` | Counter | Shard lock released by this instance |
 | `shardworker.shards.stolen` | Counter | Heartbeat detected a stolen shard |
+| `shardworker.shards.lease_lost` | Counter | Worker stopped because its lease could not be renewed before expiry |
 | `shardworker.worker.faults` | Counter | `ExecuteAsync` threw an unhandled exception |
 
 All counters carry `worker` (worker type name) and `instance_id` tags.
@@ -648,6 +667,8 @@ public sealed class AlertingObserver : IShardEngineObserver
     public void OnShardReleased(string workerName, string instanceId, int shardIndex) { }
     public void OnShardStolen(string workerName, string instanceId, int shardIndex) =>
         _alerts.Warn($"{workerName} shard {shardIndex} was stolen from {instanceId}");
+    public void OnShardLeaseLost(string workerName, string instanceId, int shardIndex) =>
+        _alerts.Error($"{workerName} shard {shardIndex} on {instanceId} could not renew its lease — is the lock database reachable?");
     public void OnWorkerFaulted(string workerName, string instanceId, int shardIndex, Exception exception) =>
         _alerts.Error($"{workerName} shard {shardIndex} faulted", exception);
 }

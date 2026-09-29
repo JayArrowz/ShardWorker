@@ -7,6 +7,7 @@ using ShardWorker.Core.Model;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
@@ -32,8 +33,13 @@ public sealed class ShardEngine<TWorker> : BackgroundService
     private readonly Random _rng = new();
     private int _acquireCursor;
 
-    // shardIndex → (worker CTS, worker Task)
-    private readonly ConcurrentDictionary<int, (CancellationTokenSource Cts, Task Task)> _held = new();
+    // How long a lease is trusted locally after the acquire/renew request was sent
+    // (LockExpiry minus the safety margin), in Stopwatch ticks.
+    private readonly long _leaseTicks;
+
+    // shardIndex → running worker. An entry stays here until its worker task has fully
+    // exited, so the acquire loop cannot start a second local worker for the same shard.
+    private readonly ConcurrentDictionary<int, HeldShard> _held = new();
 
     public ShardEngine(
         IShardLockProvider<TWorker> provider,
@@ -57,6 +63,22 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         if (_opts.HeartbeatInterval >= _opts.LockExpiry)
             throw new InvalidOperationException(
                 $"[{_workerName}] HeartbeatInterval ({_opts.HeartbeatInterval}) must be less than LockExpiry ({_opts.LockExpiry}).");
+
+        var margin = _opts.LeaseSafetyMargin ?? TimeSpan.FromTicks(_opts.LockExpiry.Ticks / 5);
+        if (margin <= TimeSpan.Zero)
+            throw new InvalidOperationException(
+                $"[{_workerName}] LeaseSafetyMargin must be greater than zero (got {margin}).");
+        if (_opts.HeartbeatInterval + margin >= _opts.LockExpiry)
+            throw new InvalidOperationException(
+                $"[{_workerName}] HeartbeatInterval ({_opts.HeartbeatInterval}) plus LeaseSafetyMargin ({margin}) " +
+                $"must be less than LockExpiry ({_opts.LockExpiry}); otherwise every lease lapses before its first renewal.");
+        if (_opts.HeartbeatInterval + _opts.HeartbeatInterval + margin >= _opts.LockExpiry)
+            _logger.LogWarning(
+                "[{Worker}] HeartbeatInterval ({Heartbeat}) leaves no room for a retry within LockExpiry ({Expiry}) " +
+                "minus LeaseSafetyMargin ({Margin}); a single failed heartbeat will stop workers.",
+                _workerName, _opts.HeartbeatInterval, _opts.LockExpiry, margin);
+
+        _leaseTicks = ToStopwatchTicks(_opts.LockExpiry - margin);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -100,9 +122,12 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             {
                 try
                 {
+                    // The database stamps the lease no earlier than this, so timing it from
+                    // the request (not the response) never overestimates how long we hold it.
+                    var requestedAt = Stopwatch.GetTimestamp();
                     var acquired = await _provider.TryAcquireManyAsync(candidates, _instanceId, _opts.LockExpiry, ct);
                     foreach (var shardIndex in acquired)
-                        StartWorker(shardIndex, ct);
+                        StartWorker(shardIndex, requestedAt + _leaseTicks, ct);
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
@@ -123,28 +148,44 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             try { await Task.Delay(_opts.HeartbeatInterval, ct); }
             catch (OperationCanceledException) { break; }
 
-            var held = _held.Keys.ToList();
+            var requestedAt = Stopwatch.GetTimestamp();
+            var held = _held
+                .Where(kv => kv.Value.IsRunning && kv.Value.LeaseCutoff > requestedAt)
+                .ToList();
             if (held.Count == 0) continue;
+
+            // A renewal still outstanding at the earliest cutoff can no longer save that shard,
+            // so stop waiting there rather than letting a hung connection stall the loop.
+            // Lease timers stop the workers independently if the provider ignores the token.
+            var earliestCutoff = held.Min(kv => kv.Value.LeaseCutoff);
+            using var renewCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            renewCts.CancelAfter(ToTimeSpan(earliestCutoff - requestedAt));
 
             try
             {
-                var renewed = await _provider.RenewManyAsync(held, _instanceId, _opts.LockExpiry, ct);
-                if (renewed.Count < held.Count)
+                var shards = held.Select(kv => kv.Key).ToList();
+                var renewed = await _provider.RenewManyAsync(shards, _instanceId, _opts.LockExpiry, renewCts.Token);
+                var renewedSet = new HashSet<int>(renewed);
+                foreach (var kv in held)
                 {
-                    var renewedSet = new HashSet<int>(renewed);
-                    foreach (var shardIndex in held)
+                    if (renewedSet.Contains(kv.Key))
                     {
-                        if (!renewedSet.Contains(shardIndex))
-                        {
-                            _logger.LogWarning("[{Worker}:{Id}] Shard {Shard} renewal failed — stopping worker",
-                                _workerName, _instanceId, shardIndex);
-                            if (StopWorker(shardIndex))
-                                TryNotify(o => o.OnShardStolen(_workerName, _instanceId, shardIndex));
-                        }
+                        kv.Value.ExtendLease(requestedAt + _leaseTicks);
+                    }
+                    else if (kv.Value.TryStop(StopReason.Stolen))
+                    {
+                        _logger.LogWarning("[{Worker}:{Id}] Shard {Shard} renewal failed — stopping worker",
+                            _workerName, _instanceId, kv.Key);
+                        TryNotify(o => o.OnShardStolen(_workerName, _instanceId, kv.Key));
                     }
                 }
             }
-            catch (OperationCanceledException) { break; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+            catch (OperationCanceledException)
+            {
+                _logger.LogError("[{Worker}:{Id}] Bulk heartbeat did not complete before the earliest lease cutoff",
+                    _workerName, _instanceId);
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "[{Worker}:{Id}] Error during bulk heartbeat", _workerName, _instanceId);
@@ -152,53 +193,71 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         }
     }
 
-    private void StartWorker(int shardIndex, CancellationToken stoppingToken)
+    private void StartWorker(int shardIndex, long leaseCutoff, CancellationToken stoppingToken)
     {
-        var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        if (Stopwatch.GetTimestamp() >= leaseCutoff)
+        {
+            _logger.LogWarning("[{Worker}:{Id}] Acquire of shard {Shard} returned too late to use the lease — not starting worker",
+                _workerName, _instanceId, shardIndex);
+            return;
+        }
 
+        var cts = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
+        var entry = new HeldShard(cts, leaseCutoff);
         var context = new ShardContext(shardIndex, _opts.TotalShards, _instanceId, _workerName);
 
-        var task = Task.Run(async () =>
+        // Created unstarted so the entry is registered before the worker can exit and
+        // remove it; otherwise a fast exit could leave a dead entry in _held forever.
+        var run = new Task<Task>(() => RunShardAsync(shardIndex, context, entry));
+        entry.Task = run.Unwrap();
+
+        if (!_held.TryAdd(shardIndex, entry))
         {
-            try
+            entry.Dispose();
+            return;
+        }
+
+        entry.StartLeaseTimer(() => OnLeaseDeadline(shardIndex, entry));
+        run.Start(TaskScheduler.Default);
+        _logger.LogInformation("[{Worker}:{Id}] Acquired shard {Shard}", _workerName, _instanceId, shardIndex);
+        TryNotify(o => o.OnShardAcquired(_workerName, _instanceId, shardIndex));
+    }
+
+    private async Task RunShardAsync(int shardIndex, ShardContext context, HeldShard entry)
+    {
+        try
+        {
+            var slotCount = _opts.WorkerConcurrency;
+            var slots = new Task[slotCount];
+            for (int i = 0; i < slotCount; i++)
+                slots[i] = RunWorkerSlotAsync(context, entry.Cts, shardIndex);
+            await Task.WhenAll(slots);
+        }
+        finally
+        {
+            _held.TryRemove(shardIndex, out _);
+            var reason = entry.StopReason;
+            entry.Dispose();
+
+            // A stolen shard belongs to someone else, so there is nothing to release. A lost
+            // lease may still be ours if the database comes back, so try to free it early.
+            if (reason != StopReason.Stolen)
             {
-                var slotCount = _opts.WorkerConcurrency;
-                var slots = new Task[slotCount];
-                for (int i = 0; i < slotCount; i++)
-                    slots[i] = RunWorkerSlotAsync(context, cts, shardIndex);
-                await Task.WhenAll(slots);
-            }
-            finally
-            {
-                var wasOwned = _held.TryRemove(shardIndex, out var removedEntry);
-                if (wasOwned)
+                try
                 {
-                    removedEntry.Cts.Dispose();
-                    try
-                    {
-                        using var releaseCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                        await _provider.ReleaseManyAsync(new[] { shardIndex }, _instanceId, releaseCts.Token);
-                        _logger.LogInformation("[{Worker}:{Id}] Released shard {Shard}", _workerName, _instanceId, shardIndex);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.LogWarning(ex, "[{Worker}:{Id}] Release failed for shard {Shard} (will expire naturally)",
-                            _workerName, _instanceId, shardIndex);
-                    }
-                    TryNotify(o => o.OnShardReleased(_workerName, _instanceId, shardIndex));
+                    using var releaseCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await _provider.ReleaseManyAsync(new[] { shardIndex }, _instanceId, releaseCts.Token);
+                    _logger.LogInformation("[{Worker}:{Id}] Released shard {Shard}", _workerName, _instanceId, shardIndex);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "[{Worker}:{Id}] Release failed for shard {Shard} (will expire naturally)",
+                        _workerName, _instanceId, shardIndex);
                 }
             }
-        }, CancellationToken.None);
 
-        if (!_held.TryAdd(shardIndex, (cts, task)))
-        {
-            cts.Cancel();
-            cts.Dispose();
-        }
-        else
-        {
-            _logger.LogInformation("[{Worker}:{Id}] Acquired shard {Shard}", _workerName, _instanceId, shardIndex);
-            TryNotify(o => o.OnShardAcquired(_workerName, _instanceId, shardIndex));
+            if (reason == StopReason.None)
+                TryNotify(o => o.OnShardReleased(_workerName, _instanceId, shardIndex));
         }
     }
 
@@ -242,6 +301,15 @@ public sealed class ShardEngine<TWorker> : BackgroundService
         }
     }
 
+    private void OnLeaseDeadline(int shardIndex, HeldShard entry)
+    {
+        if (!entry.TryStopIfLeaseExpired()) return;
+
+        _logger.LogError("[{Worker}:{Id}] Shard {Shard} lease could not be renewed before expiry — stopping worker",
+            _workerName, _instanceId, shardIndex);
+        TryNotify(o => o.OnShardLeaseLost(_workerName, _instanceId, shardIndex));
+    }
+
     private void TryNotify(Action<IShardEngineObserver> action)
     {
         foreach (var observer in _observers)
@@ -249,17 +317,6 @@ public sealed class ShardEngine<TWorker> : BackgroundService
             try { action(observer); }
             catch { /* observers must not crash the engine */ }
         }
-    }
-
-    private bool StopWorker(int shardIndex)
-    {
-        if (_held.TryRemove(shardIndex, out var entry))
-        {
-            entry.Cts.Cancel();
-            entry.Cts.Dispose();
-            return true;
-        }
-        return false;
     }
 
     public override async Task StopAsync(CancellationToken cancellationToken)
@@ -281,5 +338,121 @@ public sealed class ShardEngine<TWorker> : BackgroundService
                     _workerName, _instanceId);
         }
         catch (OperationCanceledException) { /* host forced abort — exit immediately */ }
+    }
+
+    private static long ToStopwatchTicks(TimeSpan span) => (long)(span.TotalSeconds * Stopwatch.Frequency);
+
+    private static TimeSpan ToTimeSpan(long stopwatchTicks) =>
+        TimeSpan.FromSeconds(Math.Max(0, stopwatchTicks) / (double)Stopwatch.Frequency);
+
+    private enum StopReason { None, Stolen, LeaseLost }
+
+    /// <summary>
+    /// A shard this instance is running a worker for, plus the local deadline after which
+    /// its lease can no longer be trusted.
+    /// </summary>
+    private sealed class HeldShard : IDisposable
+    {
+        private readonly object _gate = new();
+        private Timer? _leaseTimer;
+        private long _leaseCutoff;
+        private StopReason _stopReason;
+        private bool _disposed;
+        private bool _cancelling;
+
+        public HeldShard(CancellationTokenSource cts, long leaseCutoff)
+        {
+            Cts = cts;
+            _leaseCutoff = leaseCutoff;
+        }
+
+        public CancellationTokenSource Cts { get; }
+
+        public Task Task { get; set; } = Task.CompletedTask;
+
+        /// <summary>Stopwatch timestamp at which the worker must already be cancelled.</summary>
+        public long LeaseCutoff { get { lock (_gate) return _leaseCutoff; } }
+
+        public StopReason StopReason { get { lock (_gate) return _stopReason; } }
+
+        public bool IsRunning { get { lock (_gate) return !_disposed && _stopReason == StopReason.None; } }
+
+        public void StartLeaseTimer(Action onDeadline)
+        {
+            lock (_gate)
+            {
+                _leaseTimer = new Timer(_ => onDeadline(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
+                ScheduleTimer();
+            }
+        }
+
+        public void ExtendLease(long cutoff)
+        {
+            lock (_gate)
+            {
+                if (_disposed || _stopReason != StopReason.None) return;
+                _leaseCutoff = Math.Max(_leaseCutoff, cutoff);
+                ScheduleTimer();
+            }
+        }
+
+        /// <summary>Cancels the worker. Returns false if it was already stopped by someone else.</summary>
+        public bool TryStop(StopReason reason) => TryStop(reason, onlyIfLeaseExpired: false);
+
+        /// <summary>
+        /// Cancels the worker with <see cref="StopReason.LeaseLost"/> if its lease cutoff has passed.
+        /// Otherwise re-arms the timer: a renewal may have moved the cutoff after this callback was
+        /// queued, or the timer fired slightly early.
+        /// </summary>
+        public bool TryStopIfLeaseExpired() => TryStop(StopReason.LeaseLost, onlyIfLeaseExpired: true);
+
+        private bool TryStop(StopReason reason, bool onlyIfLeaseExpired)
+        {
+            lock (_gate)
+            {
+                if (_disposed || _stopReason != StopReason.None) return false;
+                if (onlyIfLeaseExpired && _leaseCutoff > Stopwatch.GetTimestamp())
+                {
+                    ScheduleTimer();
+                    return false;
+                }
+                _stopReason = reason;
+                _leaseTimer?.Dispose();
+                _leaseTimer = null;
+                _cancelling = true;
+            }
+
+            // Cancel runs worker continuations inline, which can reach Dispose before Cancel
+            // returns; disposal is deferred to here in that case.
+            try { Cts.Cancel(); }
+            finally
+            {
+                bool dispose;
+                lock (_gate)
+                {
+                    _cancelling = false;
+                    dispose = _disposed;
+                }
+                if (dispose) Cts.Dispose();
+            }
+            return true;
+        }
+
+        public void Dispose()
+        {
+            bool dispose;
+            lock (_gate)
+            {
+                if (_disposed) return;
+                _disposed = true;
+                _leaseTimer?.Dispose();
+                _leaseTimer = null;
+                dispose = !_cancelling;
+            }
+            if (dispose) Cts.Dispose();
+        }
+
+        private void ScheduleTimer() =>
+            _leaseTimer?.Change(ToTimeSpan(_leaseCutoff - Stopwatch.GetTimestamp()), Timeout.InfiniteTimeSpan);
     }
 }

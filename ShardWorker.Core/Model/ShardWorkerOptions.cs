@@ -16,6 +16,22 @@ public sealed class ShardWorkerOptions
     /// <summary>How often to renew held shards. Must be comfortably less than LockExpiry.</summary>
     public TimeSpan HeartbeatInterval { get; set; } = TimeSpan.FromSeconds(30);
 
+    /// <summary>
+    /// How long before a shard's lease runs out the engine stops its worker when renewals
+    /// keep failing (e.g. the lock database is unreachable). The lease is timed locally from
+    /// the moment the last successful acquire/renew request was sent, so the worker is
+    /// cancelled before another instance can claim the expired lock row.
+    /// <para>
+    /// The margin must cover cancellation latency in your worker and clock-rate differences
+    /// between this host and the database. When <c>null</c>, defaults to one fifth of
+    /// <see cref="LockExpiry"/>.
+    /// </para>
+    /// Cancellation is cooperative, so this narrows but cannot close the window in which two
+    /// instances process the same shard. Use a fencing check on the resource being written
+    /// if overlap must be impossible.
+    /// </summary>
+    public TimeSpan? LeaseSafetyMargin { get; set; } = null;
+
     /// <summary>How often to scan for unowned/expired shards and try to claim them.</summary>
     public TimeSpan AcquireInterval { get; set; } = TimeSpan.FromSeconds(15);
 
